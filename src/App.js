@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, setDoc, onSnapshot } from "firebase/firestore";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
@@ -24,7 +24,8 @@ const DEFAULT_CONFIG = {
   DISCOUNT: 0.23,
   TAX_RATE: 0.0015,
   MIN_FEE: 20,
-  API_KEY: '725bd665-e2ca-4ae4-ba7b-fc8312ac158f'
+  API_KEY: '725bd665-e2ca-4ae4-ba7b-fc8312ac158f',
+  ALERT_THRESHOLDS: [10, 20, 30] // 高峰回落警示閾值（%）
 };
 
 // 台股升降單位
@@ -46,9 +47,7 @@ const App = () => {
   const [showTotalChart, setShowTotalChart] = useState(false);
   const [expandedCharts, setExpandedCharts] = useState({});
   const [totalHistory, setTotalHistory] = useState([]);
-  const [showAIPanel, setShowAIPanel] = useState(false);
-  const [aiAnalysis, setAiAnalysis] = useState('');
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [alertHistory, setAlertHistory] = useState({});
 
   // --- 3. 雲端同步邏輯 ---
   useEffect(() => {
@@ -65,6 +64,9 @@ const App = () => {
           if (data.totalHistory) {
             setTotalHistory(data.totalHistory);
           }
+          if (data.alertHistory) {
+            setAlertHistory(data.alertHistory);
+          }
         }
       },
       (err) => {
@@ -75,7 +77,7 @@ const App = () => {
     return () => unsub();
   }, []);
 
-  const syncToCloud = async (newStocks, newConfig = null, newTotalHistory = null) => {
+  const syncToCloud = async (newStocks, newConfig = null, newTotalHistory = null, newAlertHistory = null) => {
     try {
       const dataToSync = { stocks: newStocks };
       if (newConfig) {
@@ -84,6 +86,9 @@ const App = () => {
       if (newTotalHistory) {
         dataToSync.totalHistory = newTotalHistory;
       }
+      if (newAlertHistory !== null) {
+        dataToSync.alertHistory = newAlertHistory;
+      }
       await setDoc(doc(db, "users", USER_DOC_ID), dataToSync, { merge: true });
       setError(null);
     } catch (e) {
@@ -91,28 +96,125 @@ const App = () => {
     }
   };
 
-  // --- 4. 股票名稱查詢 ---
+  // --- 4. 股票名稱和昨收價查詢 ---
   useEffect(() => {
     inventory.forEach(async (stock) => {
-      if (!stock.name || stock.name === '') {
+      if (!stock.name || stock.name === '' || !stock.previousClose) {
         try {
           const response = await fetch(
-            `https://api.fugle.tw/marketdata/v1.0/stock/intraday/meta?symbolId=${stock.code}&apiToken=${config.API_KEY}`
+            `https://api.fugle.tw/marketdata/v1.0/stock/intraday/quote?symbolId=${stock.code}&apiToken=${config.API_KEY}`
           );
           const data = await response.json();
-          if (data.data && data.data.meta && data.data.meta.nameZhTw) {
-            setInventory(prev => 
-              prev.map(s => s.id === stock.id ? { ...s, name: data.data.meta.nameZhTw } : s)
-            );
+          if (data.data) {
+            const updates = {};
+            if (!stock.name && data.data.info && data.data.info.nameZhTw) {
+              updates.name = data.data.info.nameZhTw;
+            }
+            if (!stock.previousClose && data.data.quote && data.data.quote.previousClose) {
+              updates.previousClose = data.data.quote.previousClose;
+            }
+            if (Object.keys(updates).length > 0) {
+              setInventory(prev => 
+                prev.map(s => s.id === stock.id ? { ...s, ...updates } : s)
+              );
+            }
           }
         } catch (e) {
-          console.error('查詢股票名稱失敗', e);
+          console.error('查詢股票資訊失敗', e);
         }
       }
     });
   }, [inventory.length, config.API_KEY]);
 
-  // --- 5. WebSocket 報價抓取 + 歷史記錄 ---
+  // --- 5. LINE 通知功能 ---
+  const sendLineNotification = useCallback(async (message) => {
+    try {
+      const response = await fetch('/api/send-line', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message })
+      });
+      
+      const data = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(data.error || 'LINE 通知發送失敗');
+      }
+      
+      return true;
+    } catch (e) {
+      console.error('LINE 通知錯誤：', e);
+      setError('LINE 通知發送失敗：' + e.message);
+      return false;
+    }
+  }, []);
+
+  // --- 6. 高峰回落警示檢查 ---
+  const checkDrawdownAlert = useCallback((stock, netProfit) => {
+    if (!stock.highPoint || netProfit >= stock.highPoint.profit) {
+      return; // 尚未達到高點或仍在創新高
+    }
+    
+    const drawdownPercent = ((stock.highPoint.profit - netProfit) / Math.abs(stock.highPoint.profit)) * 100;
+    
+    config.ALERT_THRESHOLDS.forEach(threshold => {
+      const alertKey = `${stock.code}_${threshold}`;
+      const lastAlert = alertHistory[alertKey];
+      
+      // 檢查是否達到警示條件且尚未發送過（或距上次警示超過 1 小時）
+      if (drawdownPercent >= threshold) {
+        const now = Date.now();
+        if (!lastAlert || (now - lastAlert) > 3600000) {
+          const message = `⚠️ 高峰回落警示
+
+📊 股票：${stock.code} ${stock.name || ''}
+📈 最高損益：${Math.floor(stock.highPoint.profit).toLocaleString()} 元
+📉 目前損益：${Math.floor(netProfit).toLocaleString()} 元
+⬇️ 回落幅度：${drawdownPercent.toFixed(2)}%
+
+💡 建議：考慮是否減碼或停利`;
+
+          sendLineNotification(message);
+          
+          // 記錄警示時間
+          const newAlertHistory = { ...alertHistory, [alertKey]: now };
+          setAlertHistory(newAlertHistory);
+          syncToCloud(inventory, null, null, newAlertHistory);
+        }
+      }
+    });
+  }, [alertHistory, config.ALERT_THRESHOLDS, inventory, sendLineNotification]);
+
+  // --- 7. 計算損益數據 ---
+  const calculateData = useCallback((stock) => {
+    const shares = stock.qty * 1000;
+    const buyTotal = stock.buyPrice * shares;
+    const currentTotal = stock.currentPrice * shares;
+    const buyFee = Math.max(config.MIN_FEE, Math.floor(buyTotal * config.FEE_RATE * config.DISCOUNT));
+    const totalCost = buyTotal + buyFee;
+    const sellFee = Math.max(config.MIN_FEE, Math.floor(currentTotal * config.FEE_RATE * config.DISCOUNT));
+    const tax = Math.floor(currentTotal * config.TAX_RATE);
+    const netProfit = currentTotal - sellFee - tax - totalCost;
+    const returnRate = (netProfit / totalCost) * 100;
+    const breakevenPrice = totalCost / (shares * (1 - config.FEE_RATE * config.DISCOUNT - config.TAX_RATE));
+    
+    // 計算今日漲跌幅
+    let changePercent = 0;
+    if (stock.previousClose && stock.previousClose > 0) {
+      changePercent = ((stock.currentPrice - stock.previousClose) / stock.previousClose) * 100;
+    }
+    
+    let ticksToWin = 0; 
+    let tempPrice = stock.buyPrice;
+    while (tempPrice < breakevenPrice) { 
+      tempPrice += getTickSize(tempPrice); 
+      ticksToWin++; 
+    }
+    
+    return { netProfit, returnRate, breakevenPrice, ticksToWin, changePercent };
+  }, [config]);
+
+  // --- 8. WebSocket 報價抓取 + 歷史記錄 ---
   useEffect(() => {
     if (inventory.length === 0) return;
     
@@ -141,6 +243,9 @@ const App = () => {
                 lowPoint = { profit: netProfit, time: now };
               }
               
+              // 檢查高峰回落警示
+              checkDrawdownAlert(s, netProfit);
+              
               let history = s.history || [];
               const lastRecord = history[history.length - 1];
               const shouldRecord = !lastRecord || 
@@ -168,9 +273,9 @@ const App = () => {
     });
     
     return () => connections.forEach(ws => ws.close());
-  }, [inventory.length, config.API_KEY]);
+  }, [inventory.length, config.API_KEY, calculateData, checkDrawdownAlert]);
 
-  // --- 6. 總損益歷史記錄 ---
+  // --- 9. 總損益歷史記錄 ---
   useEffect(() => {
     if (inventory.length === 0) return;
     
@@ -186,72 +291,9 @@ const App = () => {
     }, 60000);
     
     return () => clearInterval(interval);
-  }, [inventory, totalHistory]);
+  }, [inventory, totalHistory, calculateData]);
 
-  // --- 7. Gemini AI 分析 ---
-  const analyzeWithGemini = async () => {
-    setIsAnalyzing(true);
-    setShowAIPanel(true);
-    
-    try {
-      const totalNet = inventory.reduce((sum, s) => sum + calculateData(s).netProfit, 0);
-      const stockSummary = inventory.map(s => {
-        const { netProfit, returnRate } = calculateData(s);
-        return `${s.code} ${s.name}: 損益 ${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)`;
-      }).join('\n');
-      
-      const prompt = `你是一位專業的台股投資顧問。請分析以下持股狀況並提供建議：
-
-總損益：${Math.floor(totalNet).toLocaleString()} 元
-
-持股明細：
-${stockSummary}
-
-請提供：
-1. 整體投資組合評估
-2. 個股表現分析
-3. 風險提示
-4. 操作建議
-
-請用繁體中文回答，語氣專業但易懂。`;
-
-      const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=' + process.env.REACT_APP_GEMINI_API_KEY, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }]
-        })
-      });
-      
-      const data = await response.json();
-      if (data.candidates && data.candidates[0]) {
-        setAiAnalysis(data.candidates[0].content.parts[0].text);
-      } else {
-        setAiAnalysis('AI 分析失敗，請稍後再試。');
-      }
-    } catch (e) {
-      setAiAnalysis('AI 分析發生錯誤：' + e.message);
-    }
-    
-    setIsAnalyzing(false);
-  };
-
-  // --- 8. LINE 通知功能 ---
-  const sendLineNotification = async (message) => {
-    try {
-      // 使用 MCP LINE connector
-      const result = await window.mcp?.callTool?.('line', 'broadcast_message', {
-        message: { type: 'text', text: message }
-      });
-      
-      if (result) {
-        alert('LINE 通知已發送！');
-      }
-    } catch (e) {
-      alert('LINE 通知發送失敗：' + e.message);
-    }
-  };
-
+  // --- 10. LINE 每日報告 ---
   const sendDailyReport = () => {
     const totalNet = inventory.reduce((sum, s) => sum + calculateData(s).netProfit, 0);
     const profitStocks = inventory.filter(s => calculateData(s).netProfit > 0).length;
@@ -266,27 +308,13 @@ ${stockSummary}
 
 持股明細：
 ${inventory.map(s => {
-  const { netProfit, returnRate } = calculateData(s);
-  return `${s.code} ${s.name}: ${netProfit >= 0 ? '+' : ''}${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)`;
+  const { netProfit, returnRate, changePercent } = calculateData(s);
+  const changeStr = changePercent !== 0 ? ` (今日${changePercent >= 0 ? '+' : ''}${changePercent.toFixed(2)}%)` : '';
+  return `${s.code} ${s.name || ''}: ${netProfit >= 0 ? '+' : ''}${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)${changeStr}`;
 }).join('\n')}`;
     
     sendLineNotification(message);
-  };
-
-  const calculateData = (stock) => {
-    const shares = stock.qty * 1000;
-    const buyTotal = stock.buyPrice * shares;
-    const currentTotal = stock.currentPrice * shares;
-    const buyFee = Math.max(config.MIN_FEE, Math.floor(buyTotal * config.FEE_RATE * config.DISCOUNT));
-    const totalCost = buyTotal + buyFee;
-    const sellFee = Math.max(config.MIN_FEE, Math.floor(currentTotal * config.FEE_RATE * config.DISCOUNT));
-    const tax = Math.floor(currentTotal * config.TAX_RATE);
-    const netProfit = currentTotal - sellFee - tax - totalCost;
-    const returnRate = (netProfit / totalCost) * 100;
-    const breakevenPrice = totalCost / (shares * (1 - config.FEE_RATE * config.DISCOUNT - config.TAX_RATE));
-    let ticksToWin = 0; let tempPrice = stock.buyPrice;
-    while (tempPrice < breakevenPrice) { tempPrice += getTickSize(tempPrice); ticksToWin++; }
-    return { netProfit, returnRate, breakevenPrice, ticksToWin };
+    alert('LINE 報告已發送！');
   };
 
   const handleDelete = (id) => {
@@ -300,11 +328,13 @@ ${inventory.map(s => {
     if (e.key === 'Enter' && inputStr.trim()) {
       const [code, buyPrice, qty] = inputStr.trim().split(/\s+/);
       if (code && buyPrice && qty) {
-        const p = parseFloat(buyPrice); const q = parseFloat(qty);
+        const p = parseFloat(buyPrice); 
+        const q = parseFloat(qty);
         let newStocks = [...inventory];
         const idx = inventory.findIndex(s => s.code === code);
         if (idx > -1) {
-          const old = inventory[idx]; const newQty = old.qty + q;
+          const old = inventory[idx]; 
+          const newQty = old.qty + q;
           newStocks[idx] = { 
             ...old, 
             buyPrice: ((old.buyPrice * old.qty) + (p * q)) / newQty, 
@@ -317,7 +347,8 @@ ${inventory.map(s => {
             code, 
             buyPrice: p, 
             qty: q, 
-            currentPrice: p, 
+            currentPrice: p,
+            previousClose: 0,
             name: '',
             highPoint: { profit: 0, time: now },
             lowPoint: { profit: 0, time: now },
@@ -524,11 +555,6 @@ ${inventory.map(s => {
             <span style={styles.btnText}>設定</span>
           </button>
           
-          <button onClick={analyzeWithGemini} style={{...styles.actionBtn, ...styles.aiBtn}}>
-            <span style={styles.btnIcon}>🤖</span>
-            <span style={styles.btnText}>AI 分析</span>
-          </button>
-          
           <button onClick={sendDailyReport} style={{...styles.actionBtn, ...styles.lineBtn}}>
             <span style={styles.btnIcon}>📱</span>
             <span style={styles.btnText}>LINE 報告</span>
@@ -565,33 +591,13 @@ ${inventory.map(s => {
         </div>
       )}
 
-      {showAIPanel && (
-        <div style={styles.aiPanel}>
-          <div style={styles.panelHeader}>
-            <h3 style={styles.panelTitle}>🤖 AI 投資分析</h3>
-            <button onClick={() => setShowAIPanel(false)} style={styles.panelClose}>✕</button>
-          </div>
-          {isAnalyzing ? (
-            <div style={styles.aiLoading}>
-              <div style={styles.spinner}></div>
-              <p style={styles.aiLoadingText}>AI 正在分析您的投資組合...</p>
-            </div>
-          ) : (
-            <div style={styles.aiContent}>
-              {aiAnalysis.split('\n').map((line, i) => (
-                <p key={i} style={styles.aiText}>{line}</p>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
       <div style={styles.list}>
         {getSortedInventory().map(stock => {
-          const { netProfit, returnRate, breakevenPrice, ticksToWin } = calculateData(stock);
+          const { netProfit, returnRate, breakevenPrice, ticksToWin, changePercent } = calculateData(stock);
           const isProfit = netProfit >= 0;
           const isEditing = editingId === stock.id;
           const showChart = expandedCharts[stock.id];
+          const priceColor = changePercent > 0 ? '#ff4d4f' : changePercent < 0 ? '#52c41a' : '#888';
           
           return (
             <div key={stock.id} style={{ 
@@ -650,7 +656,14 @@ ${inventory.map(s => {
               <div style={styles.priceInfo}>
                 <div style={styles.priceItem}>
                   <span style={styles.priceLabel}>現價</span>
-                  <span style={styles.currentPrice}>{stock.currentPrice}</span>
+                  <span style={{ ...styles.currentPrice, color: priceColor }}>
+                    {stock.currentPrice}
+                  </span>
+                  {changePercent !== 0 && (
+                    <span style={{ ...styles.changePercent, color: priceColor }}>
+                      {changePercent >= 0 ? '▲' : '▼'} {Math.abs(changePercent).toFixed(2)}%
+                    </span>
+                  )}
                 </div>
                 <div style={styles.priceItem}>
                   <span style={styles.priceLabel}>保本</span>
@@ -692,6 +705,33 @@ ${inventory.map(s => {
                 </div>
               )}
 
+              <div style={styles.cardFooter}>
+                {isEditing ? (
+                  <div style={styles.editActions}>
+                    <button onClick={() => handleSaveEdit(stock.id)} style={styles.saveEditBtn}>
+                      <span style={styles.btnIcon}>✓</span>
+                      <span>儲存</span>
+                    </button>
+                    <button onClick={handleCancelEdit} style={styles.cancelEditBtn}>
+                      <span style={styles.btnIcon}>✕</span>
+                      <span>取消</span>
+                    </button>
+                  </div>
+                ) : (
+                  <div style={styles.cardActions}>
+                    <button onClick={() => toggleStockChart(stock.id)} style={styles.iconBtn}>
+                      <span style={styles.iconBtnIcon}>{showChart ? '📊' : '📈'}</span>
+                    </button>
+                    <button onClick={() => handleEdit(stock)} style={styles.iconBtn}>
+                      <span style={styles.iconBtnIcon}>✏️</span>
+                    </button>
+                    <button onClick={() => handleDelete(stock.id)} style={styles.deleteBtn}>
+                      <span style={styles.iconBtnIcon}>🗑️</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+
               {showChart && stock.history && stock.history.length > 0 && (
                 <div style={styles.stockChartContainer}>
                   <ResponsiveContainer width="100%" height={220}>
@@ -728,33 +768,6 @@ ${inventory.map(s => {
                   </ResponsiveContainer>
                 </div>
               )}
-              
-              <div style={styles.cardFooter}>
-                {isEditing ? (
-                  <div style={styles.editActions}>
-                    <button onClick={() => handleSaveEdit(stock.id)} style={styles.saveEditBtn}>
-                      <span style={styles.btnIcon}>✓</span>
-                      <span>儲存</span>
-                    </button>
-                    <button onClick={handleCancelEdit} style={styles.cancelEditBtn}>
-                      <span style={styles.btnIcon}>✕</span>
-                      <span>取消</span>
-                    </button>
-                  </div>
-                ) : (
-                  <div style={styles.cardActions}>
-                    <button onClick={() => toggleStockChart(stock.id)} style={styles.iconBtn}>
-                      <span style={styles.iconBtnIcon}>{showChart ? '📊' : '📈'}</span>
-                    </button>
-                    <button onClick={() => handleEdit(stock)} style={styles.iconBtn}>
-                      <span style={styles.iconBtnIcon}>✏️</span>
-                    </button>
-                    <button onClick={() => handleDelete(stock.id)} style={styles.deleteBtn}>
-                      <span style={styles.iconBtnIcon}>🗑️</span>
-                    </button>
-                  </div>
-                )}
-              </div>
             </div>
           );
         })}
@@ -974,7 +987,7 @@ const styles = {
   },
   actionBar: {
     display: 'grid',
-    gridTemplateColumns: '2fr 1fr 1fr 1fr',
+    gridTemplateColumns: '2fr 1fr 1fr',
     gap: '12px'
   },
   sortSelect: {
@@ -1005,10 +1018,6 @@ const styles = {
     transition: 'all 0.3s ease',
     boxShadow: '0 4px 16px rgba(0, 0, 0, 0.2)'
   },
-  aiBtn: {
-    background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-    border: '2px solid #764ba2'
-  },
   lineBtn: {
     background: 'linear-gradient(135deg, #06c755 0%, #00b900 100%)',
     border: '2px solid #00b900'
@@ -1027,16 +1036,6 @@ const styles = {
     marginBottom: '24px',
     boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
     border: '1px solid rgba(255, 255, 255, 0.05)'
-  },
-  aiPanel: {
-    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)',
-    padding: '24px',
-    borderRadius: '24px',
-    marginBottom: '24px',
-    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
-    border: '1px solid rgba(0, 216, 255, 0.2)',
-    maxHeight: '600px',
-    overflowY: 'auto'
   },
   panelHeader: {
     display: 'flex',
@@ -1100,28 +1099,6 @@ const styles = {
     transition: 'all 0.3s ease',
     boxShadow: '0 4px 16px rgba(0, 216, 255, 0.3)'
   },
-  aiLoading: {
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    padding: '40px 20px'
-  },
-  aiLoadingText: {
-    marginTop: '20px',
-    color: '#8b9eb3',
-    fontSize: '15px',
-    fontWeight: '500'
-  },
-  aiContent: {
-    color: '#d4dce6',
-    fontSize: '15px',
-    lineHeight: '1.8',
-    fontWeight: '400'
-  },
-  aiText: {
-    marginBottom: '12px',
-    color: '#d4dce6'
-  },
   list: { 
     display: 'flex', 
     flexDirection: 'column', 
@@ -1130,7 +1107,7 @@ const styles = {
   },
   stockCard: { 
     background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)', 
-    padding: '24px 20px', 
+    padding: '20px 18px', 
     borderRadius: '20px',
     transition: 'all 0.3s ease',
     border: '1px solid rgba(255, 255, 255, 0.05)'
@@ -1138,7 +1115,7 @@ const styles = {
   cardHeader: { 
     display: 'flex', 
     justifyContent: 'space-between',
-    marginBottom: '20px'
+    marginBottom: '16px'
   },
   stockInfo: {
     flex: 1
@@ -1147,16 +1124,16 @@ const styles = {
     display: 'flex',
     alignItems: 'center',
     gap: '12px',
-    marginBottom: '12px'
+    marginBottom: '10px'
   },
   stockCode: {
-    fontSize: '24px',
+    fontSize: '22px',
     fontWeight: '700',
     color: '#fff',
     fontFamily: "'Roboto Mono', monospace"
   },
   stockName: {
-    fontSize: '16px',
+    fontSize: '15px',
     color: '#8b9eb3',
     fontWeight: '500'
   },
@@ -1164,7 +1141,7 @@ const styles = {
     display: 'flex',
     alignItems: 'center',
     gap: '12px',
-    fontSize: '14px',
+    fontSize: '13px',
     color: '#6b7c93',
     fontWeight: '500'
   },
@@ -1206,16 +1183,16 @@ const styles = {
     textAlign: 'right',
     display: 'flex',
     flexDirection: 'column',
-    gap: '8px'
+    gap: '6px'
   },
   netProfit: { 
-    fontSize: '28px', 
+    fontSize: '24px', 
     fontWeight: '800',
     fontFamily: "'Roboto Mono', monospace",
     letterSpacing: '-0.5px'
   },
   percent: { 
-    fontSize: '18px', 
+    fontSize: '16px', 
     fontWeight: '700',
     fontFamily: "'Roboto Mono', monospace",
     display: 'flex',
@@ -1226,90 +1203,95 @@ const styles = {
   priceInfo: {
     display: 'flex',
     justifyContent: 'space-between',
-    padding: '16px',
+    padding: '14px',
     background: 'rgba(0, 0, 0, 0.2)',
     borderRadius: '14px',
-    marginBottom: '16px'
+    marginBottom: '14px'
   },
   priceItem: {
     display: 'flex',
     flexDirection: 'column',
-    gap: '8px'
+    gap: '6px'
   },
   priceLabel: {
-    fontSize: '12px',
+    fontSize: '11px',
     color: '#6b7c93',
     fontWeight: '500'
   },
   currentPrice: {
-    fontSize: '20px',
-    color: '#00d8ff',
+    fontSize: '18px',
     fontWeight: '700',
     fontFamily: "'Roboto Mono', monospace"
   },
+  changePercent: {
+    fontSize: '13px',
+    fontWeight: '600',
+    fontFamily: "'Roboto Mono', monospace",
+    marginTop: '2px'
+  },
   breakevenPrice: {
-    fontSize: '18px',
+    fontSize: '16px',
     color: '#f0ad4e',
     fontWeight: '700',
     fontFamily: "'Roboto Mono', monospace"
   },
   ticksBadge: {
-    fontSize: '12px',
+    fontSize: '11px',
     color: '#f0ad4e',
     background: 'rgba(240, 173, 78, 0.15)',
-    padding: '4px 8px',
+    padding: '3px 8px',
     borderRadius: '6px',
     fontWeight: '600',
     marginTop: '4px',
     display: 'inline-block'
   },
   extremePoints: {
-    padding: '16px',
+    padding: '14px',
     background: 'rgba(0, 0, 0, 0.3)',
     borderRadius: '14px',
     display: 'flex',
     flexDirection: 'column',
-    gap: '12px',
-    marginBottom: '16px',
+    gap: '10px',
+    marginBottom: '14px',
     border: '1px solid rgba(255, 255, 255, 0.05)'
   },
   pointItem: {
     display: 'flex',
     alignItems: 'center',
-    gap: '12px'
+    gap: '10px'
   },
   pointIcon: {
-    fontSize: '24px'
+    fontSize: '20px'
   },
   pointContent: {
     display: 'flex',
     flexDirection: 'column',
-    gap: '4px',
+    gap: '3px',
     flex: 1
   },
   pointLabel: {
-    fontSize: '12px',
+    fontSize: '11px',
     color: '#6b7c93',
     fontWeight: '500'
   },
   pointValue: {
-    fontSize: '16px',
+    fontSize: '15px',
     fontWeight: '700',
     fontFamily: "'Roboto Mono', monospace"
   },
   pointTime: {
-    fontSize: '11px',
+    fontSize: '10px',
     color: '#5a6c7d',
     fontFamily: "'Roboto Mono', monospace",
     fontWeight: '500'
   },
   cardFooter: {
-    paddingTop: '16px',
+    paddingTop: '14px',
     borderTop: '1px solid rgba(255, 255, 255, 0.05)'
   },
   cardActions: {
     display: 'flex',
-    gap: '12px',
+    gap: '10px',
     justifyContent: 'flex-end'
   },
   editActions: {
@@ -1319,35 +1301,35 @@ const styles = {
   iconBtn: {
     background: 'rgba(255, 255, 255, 0.05)',
     border: '2px solid #2a3f5f',
-    padding: '12px',
+    padding: '10px',
     borderRadius: '12px',
     cursor: 'pointer',
     transition: 'all 0.3s ease',
-    minWidth: '48px',
-    minHeight: '48px',
+    minWidth: '44px',
+    minHeight: '44px',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center'
   },
   iconBtnIcon: {
-    fontSize: '20px'
+    fontSize: '18px'
   },
   deleteBtn: {
     background: 'rgba(255, 77, 79, 0.1)',
     border: '2px solid rgba(255, 77, 79, 0.3)',
-    padding: '12px',
+    padding: '10px',
     borderRadius: '12px',
     cursor: 'pointer',
     transition: 'all 0.3s ease',
-    minWidth: '48px',
-    minHeight: '48px',
+    minWidth: '44px',
+    minHeight: '44px',
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center'
   },
   saveEditBtn: {
     flex: 1,
-    padding: '14px',
+    padding: '12px',
     borderRadius: '12px',
     border: 'none',
     background: 'linear-gradient(135deg, #52c41a 0%, #389e0d 100%)',
@@ -1364,7 +1346,7 @@ const styles = {
   },
   cancelEditBtn: {
     flex: 1,
-    padding: '14px',
+    padding: '12px',
     borderRadius: '12px',
     border: 'none',
     background: 'linear-gradient(135deg, #ff4d4f 0%, #d9363e 100%)',
