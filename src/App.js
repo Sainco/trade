@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, setDoc, onSnapshot } from "firebase/firestore";
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
 // --- 1. Firebase 設定 ---
 const firebaseConfig = {
@@ -38,10 +39,13 @@ const App = () => {
   const [config, setConfig] = useState(DEFAULT_CONFIG);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [sortBy, setSortBy] = useState('time'); // time, profit, code, return
+  const [sortBy, setSortBy] = useState('time');
   const [editingId, setEditingId] = useState(null);
   const [editValues, setEditValues] = useState({ buyPrice: '', qty: '' });
   const [showSettings, setShowSettings] = useState(false);
+  const [showTotalChart, setShowTotalChart] = useState(false);
+  const [expandedCharts, setExpandedCharts] = useState({});
+  const [totalHistory, setTotalHistory] = useState([]);
 
   // --- 3. 雲端同步邏輯 ---
   useEffect(() => {
@@ -55,6 +59,9 @@ const App = () => {
           if (data.config) {
             setConfig({ ...DEFAULT_CONFIG, ...data.config });
           }
+          if (data.totalHistory) {
+            setTotalHistory(data.totalHistory);
+          }
         }
       },
       (err) => {
@@ -65,11 +72,14 @@ const App = () => {
     return () => unsub();
   }, []);
 
-  const syncToCloud = async (newStocks, newConfig = null) => {
+  const syncToCloud = async (newStocks, newConfig = null, newTotalHistory = null) => {
     try {
       const dataToSync = { stocks: newStocks };
       if (newConfig) {
         dataToSync.config = newConfig;
+      }
+      if (newTotalHistory) {
+        dataToSync.totalHistory = newTotalHistory;
       }
       await setDoc(doc(db, "users", USER_DOC_ID), dataToSync, { merge: true });
       setError(null);
@@ -99,9 +109,10 @@ const App = () => {
     });
   }, [inventory.length, config.API_KEY]);
 
-  // --- 5. WebSocket 報價抓取 ---
+  // --- 5. WebSocket 報價抓取 + 歷史記錄 ---
   useEffect(() => {
     if (inventory.length === 0) return;
+    
     const connections = inventory.map(stock => {
       const ws = new WebSocket(
         `wss://api.fugle.tw/marketdata/v1.0/stock/intraday/quote?symbolId=${stock.code}&apiToken=${config.API_KEY}`
@@ -111,10 +122,11 @@ const App = () => {
         const data = JSON.parse(e.data);
         if (data.event === 'data' && data.data.quote.lastPrice) {
           const newPrice = data.data.quote.lastPrice;
+          const now = new Date().toISOString();
+          
           setInventory(prev => prev.map(s => {
             if (s.code === stock.code) {
               const { netProfit } = calculateData({ ...s, currentPrice: newPrice });
-              const now = new Date().toISOString();
               
               // 更新最高/最低損益記錄
               let highPoint = s.highPoint || { profit: netProfit, time: now };
@@ -127,7 +139,21 @@ const App = () => {
                 lowPoint = { profit: netProfit, time: now };
               }
               
-              return { ...s, currentPrice: newPrice, highPoint, lowPoint };
+              // 更新歷史記錄（每分鐘記錄一次）
+              let history = s.history || [];
+              const lastRecord = history[history.length - 1];
+              const shouldRecord = !lastRecord || 
+                (new Date(now) - new Date(lastRecord.time)) > 60000;
+              
+              if (shouldRecord) {
+                history = [...history, { time: now, profit: netProfit, price: newPrice }];
+                // 只保留最近 100 筆記錄
+                if (history.length > 100) {
+                  history = history.slice(-100);
+                }
+              }
+              
+              return { ...s, currentPrice: newPrice, highPoint, lowPoint, history };
             }
             return s;
           }));
@@ -140,8 +166,28 @@ const App = () => {
       
       return ws;
     });
+    
     return () => connections.forEach(ws => ws.close());
   }, [inventory.length, config.API_KEY]);
+
+  // --- 6. 總損益歷史記錄 ---
+  useEffect(() => {
+    if (inventory.length === 0) return;
+    
+    const interval = setInterval(() => {
+      const now = new Date().toISOString();
+      const totalNet = inventory.reduce((sum, s) => sum + calculateData(s).netProfit, 0);
+      
+      const newHistory = [...totalHistory, { time: now, profit: totalNet }];
+      // 只保留最近 100 筆記錄
+      const trimmedHistory = newHistory.length > 100 ? newHistory.slice(-100) : newHistory;
+      
+      setTotalHistory(trimmedHistory);
+      syncToCloud(inventory, null, trimmedHistory);
+    }, 60000); // 每分鐘記錄一次
+    
+    return () => clearInterval(interval);
+  }, [inventory, totalHistory]);
 
   const calculateData = (stock) => {
     const shares = stock.qty * 1000;
@@ -190,7 +236,8 @@ const App = () => {
             currentPrice: p, 
             name: '',
             highPoint: { profit: 0, time: now },
-            lowPoint: { profit: 0, time: now }
+            lowPoint: { profit: 0, time: now },
+            history: []
           }, ...inventory];
         }
         syncToCloud(newStocks);
@@ -228,6 +275,13 @@ const App = () => {
     setShowSettings(false);
   };
 
+  const toggleStockChart = (stockId) => {
+    setExpandedCharts(prev => ({
+      ...prev,
+      [stockId]: !prev[stockId]
+    }));
+  };
+
   // 排序邏輯
   const getSortedInventory = () => {
     const sorted = [...inventory];
@@ -241,6 +295,30 @@ const App = () => {
       default:
         return sorted;
     }
+  };
+
+  // 格式化圖表時間
+  const formatChartTime = (timeStr) => {
+    const date = new Date(timeStr);
+    return date.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
+  };
+
+  // 自訂 Tooltip
+  const CustomTooltip = ({ active, payload }) => {
+    if (active && payload && payload.length) {
+      return (
+        <div style={styles.tooltip}>
+          <p style={styles.tooltipTime}>{new Date(payload[0].payload.time).toLocaleString('zh-TW')}</p>
+          <p style={{ ...styles.tooltipValue, color: payload[0].value >= 0 ? '#ff4d4f' : '#52c41a' }}>
+            損益: {payload[0].value >= 0 ? '+' : ''}{Math.floor(payload[0].value).toLocaleString()}
+          </p>
+          {payload[0].payload.price && (
+            <p style={styles.tooltipPrice}>價格: {payload[0].payload.price}</p>
+          )}
+        </div>
+      );
+    }
+    return null;
   };
 
   const totalNet = inventory.reduce((sum, s) => sum + calculateData(s).netProfit, 0);
@@ -265,12 +343,47 @@ const App = () => {
         </div>
       )}
       
-      <div style={styles.summaryCard}>
-        <div style={styles.summaryLabel}>今日總損益 (雲端同步中)</div>
+      <div style={styles.summaryCard} onClick={() => setShowTotalChart(!showTotalChart)}>
+        <div style={styles.summaryLabel}>
+          今日總損益 (雲端同步中) 
+          <span style={styles.chartToggle}>{showTotalChart ? '📊 隱藏圖表' : '📈 顯示圖表'}</span>
+        </div>
         <div style={{ ...styles.summaryValue, color: totalNet >= 0 ? '#ff4d4f' : '#52c41a' }}>
           {totalNet >= 0 ? '+' : ''}{Math.floor(totalNet).toLocaleString()}
         </div>
       </div>
+
+      {showTotalChart && totalHistory.length > 0 && (
+        <div style={styles.chartContainer}>
+          <h3 style={styles.chartTitle}>總損益趨勢圖</h3>
+          <ResponsiveContainer width="100%" height={250}>
+            <LineChart data={totalHistory}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#333" />
+              <XAxis 
+                dataKey="time" 
+                tickFormatter={formatChartTime}
+                stroke="#888"
+                style={{ fontSize: '12px' }}
+              />
+              <YAxis 
+                stroke="#888"
+                style={{ fontSize: '12px' }}
+                tickFormatter={(value) => Math.floor(value).toLocaleString()}
+              />
+              <Tooltip content={<CustomTooltip />} />
+              <Legend />
+              <Line 
+                type="monotone" 
+                dataKey="profit" 
+                stroke="#00d8ff" 
+                strokeWidth={2}
+                dot={false}
+                name="總損益"
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
 
       <div style={styles.toolbar}>
         <input 
@@ -331,6 +444,7 @@ const App = () => {
           const { netProfit, returnRate, breakevenPrice, ticksToWin } = calculateData(stock);
           const isProfit = netProfit >= 0;
           const isEditing = editingId === stock.id;
+          const showChart = expandedCharts[stock.id];
           
           return (
             <div key={stock.id} style={{ ...styles.stockCard, borderLeft: `8px solid ${isProfit ? '#ff4d4f' : '#52c41a'}` }}>
@@ -397,6 +511,35 @@ const App = () => {
                   </div>
                 </div>
               )}
+
+              {showChart && stock.history && stock.history.length > 0 && (
+                <div style={styles.stockChartContainer}>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <LineChart data={stock.history}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#333" />
+                      <XAxis 
+                        dataKey="time" 
+                        tickFormatter={formatChartTime}
+                        stroke="#888"
+                        style={{ fontSize: '10px' }}
+                      />
+                      <YAxis 
+                        stroke="#888"
+                        style={{ fontSize: '10px' }}
+                        tickFormatter={(value) => Math.floor(value).toLocaleString()}
+                      />
+                      <Tooltip content={<CustomTooltip />} />
+                      <Line 
+                        type="monotone" 
+                        dataKey="profit" 
+                        stroke={isProfit ? '#ff4d4f' : '#52c41a'}
+                        strokeWidth={2}
+                        dot={false}
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              )}
               
               <div style={styles.cardFooter}>
                 <div style={styles.priceRow}>
@@ -411,6 +554,9 @@ const App = () => {
                     </>
                   ) : (
                     <>
+                      <button onClick={() => toggleStockChart(stock.id)} style={styles.chartBtn}>
+                        {showChart ? '📊' : '📈'}
+                      </button>
                       <button onClick={() => handleEdit(stock)} style={styles.editBtn}>編輯</button>
                       <button onClick={() => handleDelete(stock.id)} style={styles.delBtn}>刪除</button>
                     </>
@@ -465,10 +611,63 @@ const styles = {
     padding: '25px', 
     borderRadius: '20px', 
     marginBottom: '20px', 
-    textAlign: 'center' 
+    textAlign: 'center',
+    cursor: 'pointer',
+    transition: 'background 0.3s'
   },
-  summaryLabel: { fontSize: '14px', color: '#888' },
+  summaryLabel: { 
+    fontSize: '14px', 
+    color: '#888',
+    display: 'flex',
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: '10px'
+  },
+  chartToggle: {
+    fontSize: '12px',
+    color: '#00d8ff',
+    marginLeft: '10px'
+  },
   summaryValue: { fontSize: '42px', fontWeight: '900' },
+  chartContainer: {
+    backgroundColor: '#111',
+    padding: '20px',
+    borderRadius: '15px',
+    marginBottom: '20px'
+  },
+  chartTitle: {
+    color: '#fff',
+    fontSize: '16px',
+    marginBottom: '15px',
+    textAlign: 'center'
+  },
+  stockChartContainer: {
+    marginTop: '15px',
+    padding: '15px',
+    backgroundColor: '#0d0d0d',
+    borderRadius: '10px'
+  },
+  tooltip: {
+    backgroundColor: '#1a1a1a',
+    border: '1px solid #333',
+    padding: '10px',
+    borderRadius: '8px'
+  },
+  tooltipTime: {
+    color: '#888',
+    fontSize: '11px',
+    margin: '0 0 5px 0'
+  },
+  tooltipValue: {
+    fontSize: '14px',
+    fontWeight: 'bold',
+    margin: '0'
+  },
+  tooltipPrice: {
+    color: '#00d8ff',
+    fontSize: '12px',
+    margin: '5px 0 0 0'
+  },
   toolbar: { marginBottom: '20px' },
   mainInput: { 
     width: '100%', 
@@ -636,6 +835,15 @@ const styles = {
   actionButtons: {
     display: 'flex',
     gap: '10px'
+  },
+  chartBtn: {
+    backgroundColor: '#333',
+    color: '#00d8ff',
+    border: 'none',
+    padding: '6px 12px',
+    borderRadius: '6px',
+    cursor: 'pointer',
+    fontSize: '16px'
   },
   editBtn: {
     backgroundColor: '#333',
