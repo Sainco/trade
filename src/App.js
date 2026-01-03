@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { initializeApp } from "firebase/app";
 import { getFirestore, doc, setDoc, onSnapshot } from "firebase/firestore";
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 
 // --- 1. Firebase 設定 ---
 const firebaseConfig = {
@@ -46,6 +46,9 @@ const App = () => {
   const [showTotalChart, setShowTotalChart] = useState(false);
   const [expandedCharts, setExpandedCharts] = useState({});
   const [totalHistory, setTotalHistory] = useState([]);
+  const [showAIPanel, setShowAIPanel] = useState(false);
+  const [aiAnalysis, setAiAnalysis] = useState('');
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   // --- 3. 雲端同步邏輯 ---
   useEffect(() => {
@@ -128,7 +131,6 @@ const App = () => {
             if (s.code === stock.code) {
               const { netProfit } = calculateData({ ...s, currentPrice: newPrice });
               
-              // 更新最高/最低損益記錄
               let highPoint = s.highPoint || { profit: netProfit, time: now };
               let lowPoint = s.lowPoint || { profit: netProfit, time: now };
               
@@ -139,7 +141,6 @@ const App = () => {
                 lowPoint = { profit: netProfit, time: now };
               }
               
-              // 更新歷史記錄（每分鐘記錄一次）
               let history = s.history || [];
               const lastRecord = history[history.length - 1];
               const shouldRecord = !lastRecord || 
@@ -147,7 +148,6 @@ const App = () => {
               
               if (shouldRecord) {
                 history = [...history, { time: now, profit: netProfit, price: newPrice }];
-                // 只保留最近 100 筆記錄
                 if (history.length > 100) {
                   history = history.slice(-100);
                 }
@@ -179,15 +179,99 @@ const App = () => {
       const totalNet = inventory.reduce((sum, s) => sum + calculateData(s).netProfit, 0);
       
       const newHistory = [...totalHistory, { time: now, profit: totalNet }];
-      // 只保留最近 100 筆記錄
       const trimmedHistory = newHistory.length > 100 ? newHistory.slice(-100) : newHistory;
       
       setTotalHistory(trimmedHistory);
       syncToCloud(inventory, null, trimmedHistory);
-    }, 60000); // 每分鐘記錄一次
+    }, 60000);
     
     return () => clearInterval(interval);
   }, [inventory, totalHistory]);
+
+  // --- 7. Gemini AI 分析 ---
+  const analyzeWithGemini = async () => {
+    setIsAnalyzing(true);
+    setShowAIPanel(true);
+    
+    try {
+      const totalNet = inventory.reduce((sum, s) => sum + calculateData(s).netProfit, 0);
+      const stockSummary = inventory.map(s => {
+        const { netProfit, returnRate } = calculateData(s);
+        return `${s.code} ${s.name}: 損益 ${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)`;
+      }).join('\n');
+      
+      const prompt = `你是一位專業的台股投資顧問。請分析以下持股狀況並提供建議：
+
+總損益：${Math.floor(totalNet).toLocaleString()} 元
+
+持股明細：
+${stockSummary}
+
+請提供：
+1. 整體投資組合評估
+2. 個股表現分析
+3. 風險提示
+4. 操作建議
+
+請用繁體中文回答，語氣專業但易懂。`;
+
+      const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=' + process.env.REACT_APP_GEMINI_API_KEY, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }]
+        })
+      });
+      
+      const data = await response.json();
+      if (data.candidates && data.candidates[0]) {
+        setAiAnalysis(data.candidates[0].content.parts[0].text);
+      } else {
+        setAiAnalysis('AI 分析失敗，請稍後再試。');
+      }
+    } catch (e) {
+      setAiAnalysis('AI 分析發生錯誤：' + e.message);
+    }
+    
+    setIsAnalyzing(false);
+  };
+
+  // --- 8. LINE 通知功能 ---
+  const sendLineNotification = async (message) => {
+    try {
+      // 使用 MCP LINE connector
+      const result = await window.mcp?.callTool?.('line', 'broadcast_message', {
+        message: { type: 'text', text: message }
+      });
+      
+      if (result) {
+        alert('LINE 通知已發送！');
+      }
+    } catch (e) {
+      alert('LINE 通知發送失敗：' + e.message);
+    }
+  };
+
+  const sendDailyReport = () => {
+    const totalNet = inventory.reduce((sum, s) => sum + calculateData(s).netProfit, 0);
+    const profitStocks = inventory.filter(s => calculateData(s).netProfit > 0).length;
+    const lossStocks = inventory.filter(s => calculateData(s).netProfit < 0).length;
+    
+    const message = `📊 每日持股報告
+
+💰 總損益：${totalNet >= 0 ? '+' : ''}${Math.floor(totalNet).toLocaleString()} 元
+
+📈 獲利股票：${profitStocks} 檔
+📉 虧損股票：${lossStocks} 檔
+
+持股明細：
+${inventory.map(s => {
+  const { netProfit, returnRate } = calculateData(s);
+  return `${s.code} ${s.name}: ${netProfit >= 0 ? '+' : ''}${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)`;
+}).join('\n')}`;
+    
+    sendLineNotification(message);
+  };
 
   const calculateData = (stock) => {
     const shares = stock.qty * 1000;
@@ -282,7 +366,6 @@ const App = () => {
     }));
   };
 
-  // 排序邏輯
   const getSortedInventory = () => {
     const sorted = [...inventory];
     switch (sortBy) {
@@ -297,13 +380,11 @@ const App = () => {
     }
   };
 
-  // 格式化圖表時間
   const formatChartTime = (timeStr) => {
     const date = new Date(timeStr);
     return date.toLocaleTimeString('zh-TW', { hour: '2-digit', minute: '2-digit' });
   };
 
-  // 自訂 Tooltip
   const CustomTooltip = ({ active, payload }) => {
     if (active && payload && payload.length) {
       return (
@@ -328,7 +409,7 @@ const App = () => {
       <div style={styles.container}>
         <div style={styles.loadingCard}>
           <div style={styles.spinner}></div>
-          <div style={{ marginTop: '15px', color: '#888' }}>載入中...</div>
+          <div style={styles.loadingText}>載入中...</div>
         </div>
       </div>
     );
@@ -338,47 +419,76 @@ const App = () => {
     <div style={styles.container}>
       {error && (
         <div style={styles.errorBanner}>
-          ⚠️ {error}
+          <span>⚠️ {error}</span>
           <button onClick={() => setError(null)} style={styles.closeError}>✕</button>
         </div>
       )}
       
       <div style={styles.summaryCard} onClick={() => setShowTotalChart(!showTotalChart)}>
-        <div style={styles.summaryLabel}>
-          今日總損益 (雲端同步中) 
-          <span style={styles.chartToggle}>{showTotalChart ? '📊 隱藏圖表' : '📈 顯示圖表'}</span>
+        <div style={styles.summaryHeader}>
+          <span style={styles.summaryIcon}>💰</span>
+          <div>
+            <div style={styles.summaryLabel}>今日總損益</div>
+            <div style={styles.summarySubLabel}>點擊查看趨勢圖</div>
+          </div>
         </div>
         <div style={{ ...styles.summaryValue, color: totalNet >= 0 ? '#ff4d4f' : '#52c41a' }}>
           {totalNet >= 0 ? '+' : ''}{Math.floor(totalNet).toLocaleString()}
+        </div>
+        <div style={styles.summaryStats}>
+          <div style={styles.statItem}>
+            <span style={styles.statIcon}>📈</span>
+            <span style={styles.statLabel}>獲利</span>
+            <span style={styles.statValue}>{inventory.filter(s => calculateData(s).netProfit > 0).length}</span>
+          </div>
+          <div style={styles.statDivider}></div>
+          <div style={styles.statItem}>
+            <span style={styles.statIcon}>📉</span>
+            <span style={styles.statLabel}>虧損</span>
+            <span style={styles.statValue}>{inventory.filter(s => calculateData(s).netProfit < 0).length}</span>
+          </div>
+          <div style={styles.statDivider}></div>
+          <div style={styles.statItem}>
+            <span style={styles.statIcon}>📊</span>
+            <span style={styles.statLabel}>總計</span>
+            <span style={styles.statValue}>{inventory.length}</span>
+          </div>
         </div>
       </div>
 
       {showTotalChart && totalHistory.length > 0 && (
         <div style={styles.chartContainer}>
-          <h3 style={styles.chartTitle}>總損益趨勢圖</h3>
-          <ResponsiveContainer width="100%" height={250}>
+          <h3 style={styles.chartTitle}>📈 總損益趨勢圖</h3>
+          <ResponsiveContainer width="100%" height={280}>
             <LineChart data={totalHistory}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#333" />
+              <defs>
+                <linearGradient id="colorProfit" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#00d8ff" stopOpacity={0.3}/>
+                  <stop offset="95%" stopColor="#00d8ff" stopOpacity={0}/>
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="#2a3f5f" opacity={0.3} />
               <XAxis 
                 dataKey="time" 
                 tickFormatter={formatChartTime}
-                stroke="#888"
-                style={{ fontSize: '12px' }}
+                stroke="#6b7c93"
+                style={{ fontSize: '13px', fontFamily: 'Roboto Mono, monospace' }}
               />
               <YAxis 
-                stroke="#888"
-                style={{ fontSize: '12px' }}
+                stroke="#6b7c93"
+                style={{ fontSize: '13px', fontFamily: 'Roboto Mono, monospace' }}
                 tickFormatter={(value) => Math.floor(value).toLocaleString()}
               />
               <Tooltip content={<CustomTooltip />} />
-              <Legend />
               <Line 
                 type="monotone" 
                 dataKey="profit" 
                 stroke="#00d8ff" 
-                strokeWidth={2}
-                dot={false}
+                strokeWidth={3}
+                dot={{ fill: '#00d8ff', r: 4 }}
+                activeDot={{ r: 6 }}
                 name="總損益"
+                fill="url(#colorProfit)"
               />
             </LineChart>
           </ResponsiveContainer>
@@ -386,35 +496,54 @@ const App = () => {
       )}
 
       <div style={styles.toolbar}>
-        <input 
-          style={styles.mainInput} 
-          placeholder="快速輸入：股號 買價 張數" 
-          value={inputStr} 
-          onChange={(e) => setInputStr(e.target.value)} 
-          onKeyDown={handleAddStock} 
-        />
-        <div style={styles.controls}>
+        <div style={styles.inputWrapper}>
+          <span style={styles.inputIcon}>🔍</span>
+          <input 
+            style={styles.mainInput} 
+            placeholder="輸入：股號 買價 張數（按 Enter）" 
+            value={inputStr} 
+            onChange={(e) => setInputStr(e.target.value)} 
+            onKeyDown={handleAddStock} 
+          />
+        </div>
+        
+        <div style={styles.actionBar}>
           <select 
             value={sortBy} 
             onChange={(e) => setSortBy(e.target.value)}
             style={styles.sortSelect}
           >
-            <option value="time">依時間排序</option>
-            <option value="profit">依損益排序</option>
-            <option value="return">依報酬率排序</option>
-            <option value="code">依代碼排序</option>
+            <option value="time">⏰ 依時間</option>
+            <option value="profit">💰 依損益</option>
+            <option value="return">📊 依報酬率</option>
+            <option value="code">🔢 依代碼</option>
           </select>
-          <button onClick={() => setShowSettings(!showSettings)} style={styles.settingsBtn}>
-            ⚙️ 設定
+          
+          <button onClick={() => setShowSettings(!showSettings)} style={styles.actionBtn}>
+            <span style={styles.btnIcon}>⚙️</span>
+            <span style={styles.btnText}>設定</span>
+          </button>
+          
+          <button onClick={analyzeWithGemini} style={{...styles.actionBtn, ...styles.aiBtn}}>
+            <span style={styles.btnIcon}>🤖</span>
+            <span style={styles.btnText}>AI 分析</span>
+          </button>
+          
+          <button onClick={sendDailyReport} style={{...styles.actionBtn, ...styles.lineBtn}}>
+            <span style={styles.btnIcon}>📱</span>
+            <span style={styles.btnText}>LINE 報告</span>
           </button>
         </div>
       </div>
 
       {showSettings && (
         <div style={styles.settingsPanel}>
-          <h3 style={styles.settingsTitle}>手續費設定</h3>
+          <div style={styles.panelHeader}>
+            <h3 style={styles.panelTitle}>⚙️ 手續費設定</h3>
+            <button onClick={() => setShowSettings(false)} style={styles.panelClose}>✕</button>
+          </div>
           <div style={styles.settingRow}>
-            <label>券商折數（折）：</label>
+            <label style={styles.settingLabel}>券商折數（折）</label>
             <input 
               type="number" 
               step="0.01"
@@ -424,7 +553,7 @@ const App = () => {
             />
           </div>
           <div style={styles.settingRow}>
-            <label>最低手續費（元）：</label>
+            <label style={styles.settingLabel}>最低手續費（元）</label>
             <input 
               type="number"
               value={config.MIN_FEE}
@@ -432,10 +561,28 @@ const App = () => {
               style={styles.settingInput}
             />
           </div>
-          <div style={styles.settingButtons}>
-            <button onClick={handleSaveSettings} style={styles.saveBtn}>儲存</button>
-            <button onClick={() => setShowSettings(false)} style={styles.cancelBtn}>取消</button>
+          <button onClick={handleSaveSettings} style={styles.saveBtn}>💾 儲存設定</button>
+        </div>
+      )}
+
+      {showAIPanel && (
+        <div style={styles.aiPanel}>
+          <div style={styles.panelHeader}>
+            <h3 style={styles.panelTitle}>🤖 AI 投資分析</h3>
+            <button onClick={() => setShowAIPanel(false)} style={styles.panelClose}>✕</button>
           </div>
+          {isAnalyzing ? (
+            <div style={styles.aiLoading}>
+              <div style={styles.spinner}></div>
+              <p style={styles.aiLoadingText}>AI 正在分析您的投資組合...</p>
+            </div>
+          ) : (
+            <div style={styles.aiContent}>
+              {aiAnalysis.split('\n').map((line, i) => (
+                <p key={i} style={styles.aiText}>{line}</p>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -447,51 +594,81 @@ const App = () => {
           const showChart = expandedCharts[stock.id];
           
           return (
-            <div key={stock.id} style={{ ...styles.stockCard, borderLeft: `8px solid ${isProfit ? '#ff4d4f' : '#52c41a'}` }}>
+            <div key={stock.id} style={{ 
+              ...styles.stockCard, 
+              borderLeft: `6px solid ${isProfit ? '#ff4d4f' : '#52c41a'}`,
+              boxShadow: isProfit 
+                ? '0 4px 12px rgba(255, 77, 79, 0.15)' 
+                : '0 4px 12px rgba(82, 196, 90, 0.15)'
+            }}>
               <div style={styles.cardHeader}>
-                <div>
-                  <div style={styles.stockTitle}>
-                    {stock.code} {stock.name && <span style={styles.stockName}>{stock.name}</span>}
+                <div style={styles.stockInfo}>
+                  <div style={styles.stockTitleRow}>
+                    <span style={styles.stockCode}>{stock.code}</span>
+                    {stock.name && <span style={styles.stockName}>{stock.name}</span>}
                   </div>
                   {isEditing ? (
                     <div style={styles.editRow}>
-                      <input 
-                        type="number" 
-                        step="0.01"
-                        value={editValues.buyPrice}
-                        onChange={(e) => setEditValues({ ...editValues, buyPrice: e.target.value })}
-                        style={styles.editInput}
-                        placeholder="買價"
-                      />
-                      <input 
-                        type="number"
-                        value={editValues.qty}
-                        onChange={(e) => setEditValues({ ...editValues, qty: e.target.value })}
-                        style={styles.editInput}
-                        placeholder="張數"
-                      />
+                      <div style={styles.editGroup}>
+                        <label style={styles.editLabel}>買價</label>
+                        <input 
+                          type="number" 
+                          step="0.01"
+                          value={editValues.buyPrice}
+                          onChange={(e) => setEditValues({ ...editValues, buyPrice: e.target.value })}
+                          style={styles.editInput}
+                        />
+                      </div>
+                      <div style={styles.editGroup}>
+                        <label style={styles.editLabel}>張數</label>
+                        <input 
+                          type="number"
+                          value={editValues.qty}
+                          onChange={(e) => setEditValues({ ...editValues, qty: e.target.value })}
+                          style={styles.editInput}
+                        />
+                      </div>
                     </div>
                   ) : (
-                    <div style={styles.stockSub}>{stock.qty} 張 @ {stock.buyPrice.toFixed(2)}</div>
+                    <div style={styles.stockDetails}>
+                      <span style={styles.detailItem}>📦 {stock.qty} 張</span>
+                      <span style={styles.detailDivider}>•</span>
+                      <span style={styles.detailItem}>💵 {stock.buyPrice.toFixed(2)}</span>
+                    </div>
                   )}
                 </div>
                 <div style={styles.profitSection}>
                   <div style={{ ...styles.netProfit, color: isProfit ? '#ff4d4f' : '#52c41a' }}>
-                    {Math.floor(netProfit).toLocaleString()}
+                    {netProfit >= 0 ? '+' : ''}{Math.floor(netProfit).toLocaleString()}
                   </div>
                   <div style={{ ...styles.percent, color: isProfit ? '#ff4d4f' : '#52c41a' }}>
-                    {returnRate.toFixed(2)}%
+                    {returnRate >= 0 ? '▲' : '▼'} {Math.abs(returnRate).toFixed(2)}%
                   </div>
                 </div>
               </div>
               
+              <div style={styles.priceInfo}>
+                <div style={styles.priceItem}>
+                  <span style={styles.priceLabel}>現價</span>
+                  <span style={styles.currentPrice}>{stock.currentPrice}</span>
+                </div>
+                <div style={styles.priceItem}>
+                  <span style={styles.priceLabel}>保本</span>
+                  <span style={styles.breakevenPrice}>{breakevenPrice.toFixed(2)}</span>
+                  <span style={styles.ticksBadge}>{ticksToWin} 跳</span>
+                </div>
+              </div>
+
               {stock.highPoint && stock.lowPoint && (
                 <div style={styles.extremePoints}>
                   <div style={styles.pointItem}>
-                    <span style={styles.pointLabel}>📈 最高：</span>
-                    <span style={{ color: '#ff4d4f' }}>
-                      {Math.floor(stock.highPoint.profit).toLocaleString()}
-                    </span>
+                    <span style={styles.pointIcon}>📈</span>
+                    <div style={styles.pointContent}>
+                      <span style={styles.pointLabel}>最高</span>
+                      <span style={{ ...styles.pointValue, color: '#ff4d4f' }}>
+                        {Math.floor(stock.highPoint.profit).toLocaleString()}
+                      </span>
+                    </div>
                     <span style={styles.pointTime}>
                       {new Date(stock.highPoint.time).toLocaleString('zh-TW', { 
                         month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' 
@@ -499,10 +676,13 @@ const App = () => {
                     </span>
                   </div>
                   <div style={styles.pointItem}>
-                    <span style={styles.pointLabel}>📉 最低：</span>
-                    <span style={{ color: '#52c41a' }}>
-                      {Math.floor(stock.lowPoint.profit).toLocaleString()}
-                    </span>
+                    <span style={styles.pointIcon}>📉</span>
+                    <div style={styles.pointContent}>
+                      <span style={styles.pointLabel}>最低</span>
+                      <span style={{ ...styles.pointValue, color: '#52c41a' }}>
+                        {Math.floor(stock.lowPoint.profit).toLocaleString()}
+                      </span>
+                    </div>
                     <span style={styles.pointTime}>
                       {new Date(stock.lowPoint.time).toLocaleString('zh-TW', { 
                         month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' 
@@ -514,18 +694,24 @@ const App = () => {
 
               {showChart && stock.history && stock.history.length > 0 && (
                 <div style={styles.stockChartContainer}>
-                  <ResponsiveContainer width="100%" height={200}>
+                  <ResponsiveContainer width="100%" height={220}>
                     <LineChart data={stock.history}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#333" />
+                      <defs>
+                        <linearGradient id={`gradient-${stock.id}`} x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor={isProfit ? '#ff4d4f' : '#52c41a'} stopOpacity={0.3}/>
+                          <stop offset="95%" stopColor={isProfit ? '#ff4d4f' : '#52c41a'} stopOpacity={0}/>
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#2a3f5f" opacity={0.3} />
                       <XAxis 
                         dataKey="time" 
                         tickFormatter={formatChartTime}
-                        stroke="#888"
-                        style={{ fontSize: '10px' }}
+                        stroke="#6b7c93"
+                        style={{ fontSize: '11px', fontFamily: 'Roboto Mono, monospace' }}
                       />
                       <YAxis 
-                        stroke="#888"
-                        style={{ fontSize: '10px' }}
+                        stroke="#6b7c93"
+                        style={{ fontSize: '11px', fontFamily: 'Roboto Mono, monospace' }}
                         tickFormatter={(value) => Math.floor(value).toLocaleString()}
                       />
                       <Tooltip content={<CustomTooltip />} />
@@ -533,8 +719,10 @@ const App = () => {
                         type="monotone" 
                         dataKey="profit" 
                         stroke={isProfit ? '#ff4d4f' : '#52c41a'}
-                        strokeWidth={2}
-                        dot={false}
+                        strokeWidth={3}
+                        dot={{ fill: isProfit ? '#ff4d4f' : '#52c41a', r: 3 }}
+                        activeDot={{ r: 5 }}
+                        fill={`url(#gradient-${stock.id})`}
                       />
                     </LineChart>
                   </ResponsiveContainer>
@@ -542,26 +730,30 @@ const App = () => {
               )}
               
               <div style={styles.cardFooter}>
-                <div style={styles.priceRow}>
-                  現價: <span style={styles.livePrice}>{stock.currentPrice}</span>
-                  <span style={styles.breakeven}>保本: {breakevenPrice.toFixed(2)} ({ticksToWin} ✍️)</span>
-                </div>
-                <div style={styles.actionButtons}>
-                  {isEditing ? (
-                    <>
-                      <button onClick={() => handleSaveEdit(stock.id)} style={styles.saveEditBtn}>✓</button>
-                      <button onClick={handleCancelEdit} style={styles.cancelEditBtn}>✕</button>
-                    </>
-                  ) : (
-                    <>
-                      <button onClick={() => toggleStockChart(stock.id)} style={styles.chartBtn}>
-                        {showChart ? '📊' : '📈'}
-                      </button>
-                      <button onClick={() => handleEdit(stock)} style={styles.editBtn}>編輯</button>
-                      <button onClick={() => handleDelete(stock.id)} style={styles.delBtn}>刪除</button>
-                    </>
-                  )}
-                </div>
+                {isEditing ? (
+                  <div style={styles.editActions}>
+                    <button onClick={() => handleSaveEdit(stock.id)} style={styles.saveEditBtn}>
+                      <span style={styles.btnIcon}>✓</span>
+                      <span>儲存</span>
+                    </button>
+                    <button onClick={handleCancelEdit} style={styles.cancelEditBtn}>
+                      <span style={styles.btnIcon}>✕</span>
+                      <span>取消</span>
+                    </button>
+                  </div>
+                ) : (
+                  <div style={styles.cardActions}>
+                    <button onClick={() => toggleStockChart(stock.id)} style={styles.iconBtn}>
+                      <span style={styles.iconBtnIcon}>{showChart ? '📊' : '📈'}</span>
+                    </button>
+                    <button onClick={() => handleEdit(stock)} style={styles.iconBtn}>
+                      <span style={styles.iconBtnIcon}>✏️</span>
+                    </button>
+                    <button onClick={() => handleDelete(stock.id)} style={styles.deleteBtn}>
+                      <span style={styles.iconBtnIcon}>🗑️</span>
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           );
@@ -572,312 +764,620 @@ const App = () => {
 };
 
 const styles = {
-  container: { padding: '20px', backgroundColor: '#000', minHeight: '100vh', fontFamily: 'sans-serif' },
+  container: { 
+    padding: '16px', 
+    backgroundColor: '#0f1419', 
+    minHeight: '100vh', 
+    fontFamily: "'Noto Sans TC', -apple-system, BlinkMacSystemFont, sans-serif",
+    maxWidth: '100%',
+    overflowX: 'hidden'
+  },
   loadingCard: { 
-    background: '#111', 
-    padding: '50px', 
-    borderRadius: '20px', 
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)', 
+    padding: '60px 20px', 
+    borderRadius: '24px', 
     textAlign: 'center',
-    marginTop: '50px'
+    marginTop: '60px',
+    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
   },
   spinner: {
-    border: '4px solid #333',
+    border: '4px solid #2a3f5f',
     borderTop: '4px solid #00d8ff',
     borderRadius: '50%',
-    width: '50px',
-    height: '50px',
+    width: '56px',
+    height: '56px',
     animation: 'spin 1s linear infinite',
     margin: '0 auto'
   },
+  loadingText: {
+    marginTop: '20px',
+    color: '#8b9eb3',
+    fontSize: '16px',
+    fontWeight: '500'
+  },
   errorBanner: {
-    backgroundColor: '#ff4d4f',
+    background: 'linear-gradient(135deg, #ff4d4f 0%, #d9363e 100%)',
     color: '#fff',
-    padding: '15px',
-    borderRadius: '10px',
+    padding: '16px 20px',
+    borderRadius: '16px',
     marginBottom: '20px',
     display: 'flex',
     justifyContent: 'space-between',
-    alignItems: 'center'
+    alignItems: 'center',
+    fontSize: '15px',
+    fontWeight: '500',
+    boxShadow: '0 4px 16px rgba(255, 77, 79, 0.3)'
   },
   closeError: {
-    background: 'none',
+    background: 'rgba(255, 255, 255, 0.2)',
     border: 'none',
     color: '#fff',
     fontSize: '20px',
-    cursor: 'pointer'
+    cursor: 'pointer',
+    width: '32px',
+    height: '32px',
+    borderRadius: '50%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    transition: 'all 0.3s ease'
   },
   summaryCard: { 
-    background: '#111', 
-    padding: '25px', 
-    borderRadius: '20px', 
-    marginBottom: '20px', 
-    textAlign: 'center',
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)', 
+    padding: '28px 24px', 
+    borderRadius: '24px', 
+    marginBottom: '24px', 
     cursor: 'pointer',
-    transition: 'background 0.3s'
+    transition: 'all 0.3s ease',
+    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
+    border: '1px solid rgba(255, 255, 255, 0.05)'
+  },
+  summaryHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '16px',
+    marginBottom: '20px'
+  },
+  summaryIcon: {
+    fontSize: '42px',
+    filter: 'drop-shadow(0 2px 8px rgba(0, 216, 255, 0.3))'
   },
   summaryLabel: { 
-    fontSize: '14px', 
-    color: '#888',
+    fontSize: '16px', 
+    color: '#8b9eb3',
+    fontWeight: '500',
+    marginBottom: '4px'
+  },
+  summarySubLabel: {
+    fontSize: '13px',
+    color: '#5a6c7d',
+    fontWeight: '400'
+  },
+  summaryValue: { 
+    fontSize: '52px', 
+    fontWeight: '900',
+    fontFamily: "'Roboto Mono', monospace",
+    marginBottom: '24px',
+    textShadow: '0 2px 12px rgba(0, 216, 255, 0.3)',
+    letterSpacing: '-1px'
+  },
+  summaryStats: {
     display: 'flex',
-    justifyContent: 'center',
+    justifyContent: 'space-around',
     alignItems: 'center',
-    gap: '10px'
+    padding: '16px 0',
+    background: 'rgba(0, 0, 0, 0.2)',
+    borderRadius: '16px'
   },
-  chartToggle: {
+  statItem: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    gap: '8px'
+  },
+  statIcon: {
+    fontSize: '24px'
+  },
+  statLabel: {
     fontSize: '12px',
-    color: '#00d8ff',
-    marginLeft: '10px'
+    color: '#6b7c93',
+    fontWeight: '500'
   },
-  summaryValue: { fontSize: '42px', fontWeight: '900' },
+  statValue: {
+    fontSize: '20px',
+    color: '#fff',
+    fontWeight: '700',
+    fontFamily: "'Roboto Mono', monospace"
+  },
+  statDivider: {
+    width: '1px',
+    height: '48px',
+    background: 'rgba(255, 255, 255, 0.1)'
+  },
   chartContainer: {
-    backgroundColor: '#111',
-    padding: '20px',
-    borderRadius: '15px',
-    marginBottom: '20px'
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)',
+    padding: '24px 20px',
+    borderRadius: '24px',
+    marginBottom: '24px',
+    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
+    border: '1px solid rgba(255, 255, 255, 0.05)'
   },
   chartTitle: {
     color: '#fff',
-    fontSize: '16px',
-    marginBottom: '15px',
+    fontSize: '18px',
+    fontWeight: '600',
+    marginBottom: '20px',
     textAlign: 'center'
   },
   stockChartContainer: {
-    marginTop: '15px',
-    padding: '15px',
-    backgroundColor: '#0d0d0d',
-    borderRadius: '10px'
+    marginTop: '20px',
+    padding: '20px 16px',
+    background: 'rgba(0, 0, 0, 0.3)',
+    borderRadius: '16px',
+    border: '1px solid rgba(255, 255, 255, 0.05)'
   },
   tooltip: {
-    backgroundColor: '#1a1a1a',
-    border: '1px solid #333',
-    padding: '10px',
-    borderRadius: '8px'
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)',
+    border: '1px solid rgba(0, 216, 255, 0.3)',
+    padding: '12px 16px',
+    borderRadius: '12px',
+    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.4)'
   },
   tooltipTime: {
-    color: '#888',
-    fontSize: '11px',
-    margin: '0 0 5px 0'
+    color: '#8b9eb3',
+    fontSize: '12px',
+    margin: '0 0 8px 0',
+    fontFamily: "'Roboto Mono', monospace"
   },
   tooltipValue: {
-    fontSize: '14px',
-    fontWeight: 'bold',
-    margin: '0'
+    fontSize: '16px',
+    fontWeight: '700',
+    margin: '0',
+    fontFamily: "'Roboto Mono', monospace"
   },
   tooltipPrice: {
     color: '#00d8ff',
-    fontSize: '12px',
-    margin: '5px 0 0 0'
+    fontSize: '14px',
+    margin: '8px 0 0 0',
+    fontFamily: "'Roboto Mono', monospace"
   },
-  toolbar: { marginBottom: '20px' },
+  toolbar: { 
+    marginBottom: '24px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '16px'
+  },
+  inputWrapper: {
+    position: 'relative',
+    width: '100%'
+  },
+  inputIcon: {
+    position: 'absolute',
+    left: '20px',
+    top: '50%',
+    transform: 'translateY(-50%)',
+    fontSize: '20px',
+    pointerEvents: 'none'
+  },
   mainInput: { 
     width: '100%', 
-    padding: '18px', 
-    marginBottom: '15px', 
-    borderRadius: '12px', 
-    border: 'none', 
-    backgroundColor: '#222', 
+    padding: '18px 20px 18px 56px', 
+    borderRadius: '16px', 
+    border: '2px solid #2a3f5f', 
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)', 
     color: '#fff', 
-    fontSize: '18px', 
-    boxSizing: 'border-box' 
+    fontSize: '16px', 
+    boxSizing: 'border-box',
+    fontWeight: '500',
+    transition: 'all 0.3s ease',
+    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.2)'
   },
-  controls: { 
-    display: 'flex', 
-    gap: '10px', 
-    justifyContent: 'space-between' 
+  actionBar: {
+    display: 'grid',
+    gridTemplateColumns: '2fr 1fr 1fr 1fr',
+    gap: '12px'
   },
   sortSelect: {
-    flex: 1,
-    padding: '12px',
-    borderRadius: '10px',
-    border: 'none',
-    backgroundColor: '#222',
+    padding: '14px 16px',
+    borderRadius: '14px',
+    border: '2px solid #2a3f5f',
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)',
     color: '#fff',
-    fontSize: '16px'
+    fontSize: '15px',
+    fontWeight: '500',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.2)'
   },
-  settingsBtn: {
-    padding: '12px 20px',
-    borderRadius: '10px',
-    border: 'none',
-    backgroundColor: '#333',
+  actionBtn: {
+    padding: '14px 16px',
+    borderRadius: '14px',
+    border: '2px solid #2a3f5f',
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)',
     color: '#fff',
     cursor: 'pointer',
-    fontSize: '16px'
+    fontSize: '15px',
+    fontWeight: '600',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '8px',
+    transition: 'all 0.3s ease',
+    boxShadow: '0 4px 16px rgba(0, 0, 0, 0.2)'
+  },
+  aiBtn: {
+    background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+    border: '2px solid #764ba2'
+  },
+  lineBtn: {
+    background: 'linear-gradient(135deg, #06c755 0%, #00b900 100%)',
+    border: '2px solid #00b900'
+  },
+  btnIcon: {
+    fontSize: '18px'
+  },
+  btnText: {
+    fontSize: '14px',
+    fontWeight: '600'
   },
   settingsPanel: {
-    backgroundColor: '#161616',
-    padding: '20px',
-    borderRadius: '15px',
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)',
+    padding: '24px',
+    borderRadius: '24px',
+    marginBottom: '24px',
+    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
+    border: '1px solid rgba(255, 255, 255, 0.05)'
+  },
+  aiPanel: {
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)',
+    padding: '24px',
+    borderRadius: '24px',
+    marginBottom: '24px',
+    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
+    border: '1px solid rgba(0, 216, 255, 0.2)',
+    maxHeight: '600px',
+    overflowY: 'auto'
+  },
+  panelHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     marginBottom: '20px'
   },
-  settingsTitle: {
+  panelTitle: {
     color: '#fff',
-    fontSize: '18px',
-    marginBottom: '15px'
+    fontSize: '20px',
+    fontWeight: '600',
+    margin: 0
+  },
+  panelClose: {
+    background: 'rgba(255, 255, 255, 0.1)',
+    border: 'none',
+    color: '#fff',
+    fontSize: '24px',
+    cursor: 'pointer',
+    width: '36px',
+    height: '36px',
+    borderRadius: '50%',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    transition: 'all 0.3s ease'
   },
   settingRow: {
     display: 'flex',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: '15px',
-    color: '#aaa'
+    marginBottom: '20px'
+  },
+  settingLabel: {
+    color: '#8b9eb3',
+    fontSize: '15px',
+    fontWeight: '500'
   },
   settingInput: {
-    padding: '8px',
-    borderRadius: '8px',
-    border: 'none',
-    backgroundColor: '#222',
+    padding: '12px 16px',
+    borderRadius: '12px',
+    border: '2px solid #2a3f5f',
+    background: 'rgba(0, 0, 0, 0.3)',
     color: '#fff',
-    width: '100px',
-    fontSize: '16px'
-  },
-  settingButtons: {
-    display: 'flex',
-    gap: '10px',
-    marginTop: '20px'
+    width: '120px',
+    fontSize: '16px',
+    fontWeight: '600',
+    fontFamily: "'Roboto Mono', monospace",
+    textAlign: 'right'
   },
   saveBtn: {
-    flex: 1,
-    padding: '12px',
-    borderRadius: '10px',
+    width: '100%',
+    padding: '16px',
+    borderRadius: '14px',
     border: 'none',
-    backgroundColor: '#00d8ff',
+    background: 'linear-gradient(135deg, #00d8ff 0%, #0099cc 100%)',
     color: '#000',
-    fontWeight: 'bold',
-    cursor: 'pointer'
+    fontWeight: '700',
+    fontSize: '16px',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    boxShadow: '0 4px 16px rgba(0, 216, 255, 0.3)'
   },
-  cancelBtn: {
-    flex: 1,
-    padding: '12px',
-    borderRadius: '10px',
-    border: 'none',
-    backgroundColor: '#333',
-    color: '#fff',
-    cursor: 'pointer'
+  aiLoading: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    padding: '40px 20px'
   },
-  list: { display: 'flex', flexDirection: 'column', gap: '15px' },
+  aiLoadingText: {
+    marginTop: '20px',
+    color: '#8b9eb3',
+    fontSize: '15px',
+    fontWeight: '500'
+  },
+  aiContent: {
+    color: '#d4dce6',
+    fontSize: '15px',
+    lineHeight: '1.8',
+    fontWeight: '400'
+  },
+  aiText: {
+    marginBottom: '12px',
+    color: '#d4dce6'
+  },
+  list: { 
+    display: 'flex', 
+    flexDirection: 'column', 
+    gap: '16px',
+    paddingBottom: '24px'
+  },
   stockCard: { 
-    backgroundColor: '#161616', 
-    padding: '20px', 
-    borderRadius: '15px' 
+    background: 'linear-gradient(135deg, #1a2332 0%, #2c3e50 100%)', 
+    padding: '24px 20px', 
+    borderRadius: '20px',
+    transition: 'all 0.3s ease',
+    border: '1px solid rgba(255, 255, 255, 0.05)'
   },
-  cardHeader: { display: 'flex', justifyContent: 'space-between' },
-  stockTitle: { 
-    fontSize: '22px', 
-    fontWeight: 'bold', 
-    color: '#fff',
+  cardHeader: { 
+    display: 'flex', 
+    justifyContent: 'space-between',
+    marginBottom: '20px'
+  },
+  stockInfo: {
+    flex: 1
+  },
+  stockTitleRow: {
     display: 'flex',
     alignItems: 'center',
-    gap: '10px'
+    gap: '12px',
+    marginBottom: '12px'
+  },
+  stockCode: {
+    fontSize: '24px',
+    fontWeight: '700',
+    color: '#fff',
+    fontFamily: "'Roboto Mono', monospace"
   },
   stockName: {
     fontSize: '16px',
-    color: '#888',
-    fontWeight: 'normal'
+    color: '#8b9eb3',
+    fontWeight: '500'
   },
-  stockSub: { fontSize: '14px', color: '#666', marginTop: '5px' },
+  stockDetails: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '12px',
+    fontSize: '14px',
+    color: '#6b7c93',
+    fontWeight: '500'
+  },
+  detailItem: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px'
+  },
+  detailDivider: {
+    color: '#3a4a5f'
+  },
   editRow: {
     display: 'flex',
-    gap: '10px',
-    marginTop: '10px'
+    gap: '16px',
+    marginTop: '12px'
   },
-  editInput: {
-    padding: '8px',
-    borderRadius: '8px',
-    border: 'none',
-    backgroundColor: '#222',
-    color: '#fff',
-    fontSize: '14px',
-    width: '80px'
-  },
-  profitSection: { textAlign: 'right' },
-  netProfit: { fontSize: '26px', fontWeight: 'bold' },
-  percent: { fontSize: '20px', fontWeight: 'bold' },
-  extremePoints: {
-    marginTop: '15px',
-    padding: '12px',
-    backgroundColor: '#0d0d0d',
-    borderRadius: '10px',
+  editGroup: {
     display: 'flex',
     flexDirection: 'column',
     gap: '8px'
   },
+  editLabel: {
+    fontSize: '12px',
+    color: '#6b7c93',
+    fontWeight: '500'
+  },
+  editInput: {
+    padding: '10px 14px',
+    borderRadius: '10px',
+    border: '2px solid #2a3f5f',
+    background: 'rgba(0, 0, 0, 0.3)',
+    color: '#fff',
+    fontSize: '15px',
+    fontWeight: '600',
+    width: '100px',
+    fontFamily: "'Roboto Mono', monospace"
+  },
+  profitSection: { 
+    textAlign: 'right',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px'
+  },
+  netProfit: { 
+    fontSize: '28px', 
+    fontWeight: '800',
+    fontFamily: "'Roboto Mono', monospace",
+    letterSpacing: '-0.5px'
+  },
+  percent: { 
+    fontSize: '18px', 
+    fontWeight: '700',
+    fontFamily: "'Roboto Mono', monospace",
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: '4px'
+  },
+  priceInfo: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    padding: '16px',
+    background: 'rgba(0, 0, 0, 0.2)',
+    borderRadius: '14px',
+    marginBottom: '16px'
+  },
+  priceItem: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px'
+  },
+  priceLabel: {
+    fontSize: '12px',
+    color: '#6b7c93',
+    fontWeight: '500'
+  },
+  currentPrice: {
+    fontSize: '20px',
+    color: '#00d8ff',
+    fontWeight: '700',
+    fontFamily: "'Roboto Mono', monospace"
+  },
+  breakevenPrice: {
+    fontSize: '18px',
+    color: '#f0ad4e',
+    fontWeight: '700',
+    fontFamily: "'Roboto Mono', monospace"
+  },
+  ticksBadge: {
+    fontSize: '12px',
+    color: '#f0ad4e',
+    background: 'rgba(240, 173, 78, 0.15)',
+    padding: '4px 8px',
+    borderRadius: '6px',
+    fontWeight: '600',
+    marginTop: '4px',
+    display: 'inline-block'
+  },
+  extremePoints: {
+    padding: '16px',
+    background: 'rgba(0, 0, 0, 0.3)',
+    borderRadius: '14px',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '12px',
+    marginBottom: '16px',
+    border: '1px solid rgba(255, 255, 255, 0.05)'
+  },
   pointItem: {
     display: 'flex',
     alignItems: 'center',
-    gap: '8px',
-    fontSize: '13px'
+    gap: '12px'
+  },
+  pointIcon: {
+    fontSize: '24px'
+  },
+  pointContent: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '4px',
+    flex: 1
   },
   pointLabel: {
-    color: '#888',
-    minWidth: '60px'
+    fontSize: '12px',
+    color: '#6b7c93',
+    fontWeight: '500'
+  },
+  pointValue: {
+    fontSize: '16px',
+    fontWeight: '700',
+    fontFamily: "'Roboto Mono', monospace"
   },
   pointTime: {
-    color: '#666',
     fontSize: '11px',
-    marginLeft: 'auto'
+    color: '#5a6c7d',
+    fontFamily: "'Roboto Mono', monospace",
+    fontWeight: '500'
   },
-  cardFooter: { 
-    marginTop: '15px', 
-    paddingTop: '15px', 
-    borderTop: '1px solid #333', 
-    display: 'flex', 
-    justifyContent: 'space-between', 
-    alignItems: 'center' 
+  cardFooter: {
+    paddingTop: '16px',
+    borderTop: '1px solid rgba(255, 255, 255, 0.05)'
   },
-  priceRow: { fontSize: '14px', color: '#aaa' },
-  livePrice: { 
-    color: '#00d8ff', 
-    fontWeight: 'bold', 
-    fontSize: '16px', 
-    marginRight: '10px' 
-  },
-  breakeven: { color: '#faad14' },
-  actionButtons: {
+  cardActions: {
     display: 'flex',
-    gap: '10px'
+    gap: '12px',
+    justifyContent: 'flex-end'
   },
-  chartBtn: {
-    backgroundColor: '#333',
-    color: '#00d8ff',
-    border: 'none',
-    padding: '6px 12px',
-    borderRadius: '6px',
+  editActions: {
+    display: 'flex',
+    gap: '12px'
+  },
+  iconBtn: {
+    background: 'rgba(255, 255, 255, 0.05)',
+    border: '2px solid #2a3f5f',
+    padding: '12px',
+    borderRadius: '12px',
     cursor: 'pointer',
-    fontSize: '16px'
+    transition: 'all 0.3s ease',
+    minWidth: '48px',
+    minHeight: '48px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center'
   },
-  editBtn: {
-    backgroundColor: '#333',
-    color: '#00d8ff',
-    border: 'none',
-    padding: '6px 12px',
-    borderRadius: '6px',
-    cursor: 'pointer'
+  iconBtnIcon: {
+    fontSize: '20px'
   },
-  delBtn: { 
-    backgroundColor: '#333', 
-    color: '#ff4d4f', 
-    border: 'none', 
-    padding: '6px 12px', 
-    borderRadius: '6px', 
-    cursor: 'pointer' 
+  deleteBtn: {
+    background: 'rgba(255, 77, 79, 0.1)',
+    border: '2px solid rgba(255, 77, 79, 0.3)',
+    padding: '12px',
+    borderRadius: '12px',
+    cursor: 'pointer',
+    transition: 'all 0.3s ease',
+    minWidth: '48px',
+    minHeight: '48px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center'
   },
   saveEditBtn: {
-    backgroundColor: '#52c41a',
-    color: '#fff',
+    flex: 1,
+    padding: '14px',
+    borderRadius: '12px',
     border: 'none',
-    padding: '6px 12px',
-    borderRadius: '6px',
+    background: 'linear-gradient(135deg, #52c41a 0%, #389e0d 100%)',
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: '15px',
     cursor: 'pointer',
-    fontSize: '16px'
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '8px',
+    transition: 'all 0.3s ease',
+    boxShadow: '0 4px 16px rgba(82, 196, 26, 0.3)'
   },
   cancelEditBtn: {
-    backgroundColor: '#ff4d4f',
-    color: '#fff',
+    flex: 1,
+    padding: '14px',
+    borderRadius: '12px',
     border: 'none',
-    padding: '6px 12px',
-    borderRadius: '6px',
+    background: 'linear-gradient(135deg, #ff4d4f 0%, #d9363e 100%)',
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: '15px',
     cursor: 'pointer',
-    fontSize: '16px'
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: '8px',
+    transition: 'all 0.3s ease',
+    boxShadow: '0 4px 16px rgba(255, 77, 79, 0.3)'
   }
 };
 
