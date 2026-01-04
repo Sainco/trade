@@ -186,7 +186,7 @@ const App = () => {
     }
   }, []);
 
-  // --- 6. 高峰回落警示檢查（支援5%、個別/總部位、無時間限制TG推送） ---
+  // --- 6. 高峰回落警示檢查 ---
   const checkDrawdownAlert = useCallback((stock, netProfit) => {
     if (!stock.highPoint || netProfit >= stock.highPoint.profit) {
       return; // 尚未達到高點或仍在創新高
@@ -221,109 +221,89 @@ const App = () => {
         }
         
         // Telegram 通知：即時推送（無時間限制）
-        sendTelegramNotification(message);
-        const newAlertHistory = { ...alertHistory, [telegramKey]: now };
-        setAlertHistory(newAlertHistory);
-        syncToCloud(inventory, null, null, newAlertHistory);
+        if (!lastTelegramAlert || drawdownPercent > threshold) {
+          sendTelegramNotification(message);
+          const newAlertHistory = { ...alertHistory, [telegramKey]: now };
+          setAlertHistory(newAlertHistory);
+          syncToCloud(inventory, null, null, newAlertHistory);
+        }
       }
     });
   }, [alertHistory, config.ALERT_THRESHOLDS, inventory, sendLineNotification, sendTelegramNotification, syncToCloud]);
 
-  // --- 6.5 價格警示檢查（完整版：減碼價、目標價、停損價、大漲大跌、無時間限制TG推送） ---
-  const checkPriceAlerts = useCallback((stock, currentPrice, yesterdayClose) => {
+  // --- 6.5 價格警示檢查（目標價、停損價、大漲大跌） ---
+  const checkPriceAlerts = useCallback((stock, currentPrice) => {
+    const alertKey = `price_${stock.code}`;
+    const lastAlert = alertHistory[alertKey] || {};
     const now = Date.now();
-    const costPrice = stock.buyPrice;
-    const priceChangePercent = ((currentPrice - (yesterdayClose || costPrice)) / (yesterdayClose || costPrice)) * 100;
-    const priceChangePoints = currentPrice - (yesterdayClose || costPrice);
     
-    // 1. 減碼價警示 (成本價 +2%, +3%, +4%)
-    config.REDUCE_PRICES.forEach(reducePercent => {
-      const reducePrice = costPrice * (1 + reducePercent / 100);
-      const alertKey = `reduce_${stock.code}_${reducePercent}`;
-      const lastAlert = alertHistory[alertKey] || 0;
-      
-      if (currentPrice >= reducePrice && (now - lastAlert) > 60000) { // 一分鐘內最多一次
-        const message = `💰 減碼價警示 (${reducePercent}%)
+    // 1. 目標價警示
+    if (priceAlerts[stock.code]?.target && currentPrice >= priceAlerts[stock.code].target) {
+      if (!lastAlert.target || (now - lastAlert.target) > 3600000) {
+        const message = `🎯 達到目標價警示
 
 📊 股票：${stock.code} ${stock.name || ''}
-💵 成本價：${costPrice.toFixed(2)} 元
-🎯 減碼價：${reducePrice.toFixed(2)} 元
-📈 現價：${currentPrice.toFixed(2)} 元
-📊 漲跌：${priceChangePercent > 0 ? '▲' : '▼'} ${Math.abs(priceChangePercent).toFixed(2)}% (${priceChangePoints > 0 ? '+' : ''}${priceChangePoints.toFixed(2)} 點)
+🎯 目標價：${priceAlerts[stock.code].target} 元
+💵 現價：${currentPrice} 元
 
-💡 建議：考慮減碼部位`;
+💡 建議：考慮是否停利出場`;
         
+        sendLineNotification(message);
         sendTelegramNotification(message);
-        const newAlertHistory = { ...alertHistory, [alertKey]: now };
+        
+        const newAlertHistory = { ...alertHistory, [alertKey]: { ...lastAlert, target: now } };
         setAlertHistory(newAlertHistory);
         syncToCloud(inventory, null, null, newAlertHistory);
       }
-    });
-    
-    // 2. 目標價警示 (成本價 +5%)
-    const targetPrice = costPrice * (1 + config.TARGET_PRICE_PERCENT / 100);
-    const targetAlertKey = `target_${stock.code}`;
-    const lastTargetAlert = alertHistory[targetAlertKey] || 0;
-    
-    if (currentPrice >= targetPrice && (now - lastTargetAlert) > 60000) {
-      const message = `🎯 達到目標價警示
-
-📊 股票：${stock.code} ${stock.name || ''}
-💵 成本價：${costPrice.toFixed(2)} 元
-🎯 目標價：${targetPrice.toFixed(2)} 元
-📈 現價：${currentPrice.toFixed(2)} 元
-📊 漲跌：${priceChangePercent > 0 ? '▲' : '▼'} ${Math.abs(priceChangePercent).toFixed(2)}% (${priceChangePoints > 0 ? '+' : ''}${priceChangePoints.toFixed(2)} 點)
-
-💡 建議：考慮停利出場`;
-      
-      sendTelegramNotification(message);
-      const newAlertHistory = { ...alertHistory, [targetAlertKey]: now };
-      setAlertHistory(newAlertHistory);
-      syncToCloud(inventory, null, null, newAlertHistory);
     }
     
-    // 3. 停損價警示 (成本價 -2%)
-    const stopLossPrice = costPrice * (1 + config.STOP_LOSS_PERCENT / 100);
-    const stopLossAlertKey = `stoploss_${stock.code}`;
-    const lastStopLossAlert = alertHistory[stopLossAlertKey] || 0;
-    
-    if (currentPrice <= stopLossPrice && (now - lastStopLossAlert) > 60000) {
-      const message = `⛔ 跌破停損價警示
+    // 2. 停損價警示
+    if (priceAlerts[stock.code]?.stopLoss && currentPrice <= priceAlerts[stock.code].stopLoss) {
+      if (!lastAlert.stopLoss || (now - lastAlert.stopLoss) > 3600000) {
+        const message = `⛔ 跌破停損價警示
 
 📊 股票：${stock.code} ${stock.name || ''}
-💵 成本價：${costPrice.toFixed(2)} 元
-⛔ 停損價：${stopLossPrice.toFixed(2)} 元
-📉 現價：${currentPrice.toFixed(2)} 元
-📊 漲跌：${priceChangePercent > 0 ? '▲' : '▼'} ${Math.abs(priceChangePercent).toFixed(2)}% (${priceChangePoints > 0 ? '+' : ''}${priceChangePoints.toFixed(2)} 點)
+⛔ 停損價：${priceAlerts[stock.code].stopLoss} 元
+💵 現價：${currentPrice} 元
 
-⚠️ 建議：考慮停損出場`;
-      
-      sendTelegramNotification(message);
-      const newAlertHistory = { ...alertHistory, [stopLossAlertKey]: now };
-      setAlertHistory(newAlertHistory);
-      syncToCloud(inventory, null, null, newAlertHistory);
+⚠️ 建議：考慮是否停損出場`;
+        
+        sendLineNotification(message);
+        sendTelegramNotification(message);
+        
+        const newAlertHistory = { ...alertHistory, [alertKey]: { ...lastAlert, stopLoss: now } };
+        setAlertHistory(newAlertHistory);
+        syncToCloud(inventory, null, null, newAlertHistory);
+      }
     }
     
-    // 4. 大漲大跌警示 (單日 ≥ 5%)
-    const priceChangeAlertKey = `pricechange_${stock.code}`;
-    const lastPriceChangeAlert = alertHistory[priceChangeAlertKey] || 0;
-    
-    if (Math.abs(priceChangePercent) >= config.PRICE_CHANGE_ALERT && (now - lastPriceChangeAlert) > 60000) {
-      const message = `🚨 大漲大跌警示
+    // 3. 大漲大跌警示
+    if (stock.previousClose) {
+      const changePercent = ((currentPrice - stock.previousClose) / stock.previousClose) * 100;
+      
+      if (Math.abs(changePercent) >= config.PRICE_CHANGE_ALERT) {
+        if (!lastAlert.priceChange || (now - lastAlert.priceChange) > 3600000) {
+          const direction = changePercent > 0 ? '大漲' : '大跌';
+          const emoji = changePercent > 0 ? '🚀' : '📉';
+          const message = `${emoji} ${direction}警示
 
 📊 股票：${stock.code} ${stock.name || ''}
-📈 現價：${currentPrice.toFixed(2)} 元
-📊 漲跌：${priceChangePercent > 0 ? '▲' : '▼'} ${Math.abs(priceChangePercent).toFixed(2)}% (${priceChangePoints > 0 ? '+' : ''}${priceChangePoints.toFixed(2)} 點)
+💵 現價：${currentPrice} 元
+📈 漲跌幅：${changePercent >= 0 ? '+' : ''}${changePercent.toFixed(2)}%
+📅 昨收：${stock.previousClose} 元
 
-💡 建議：注意市場變化`;
-      
-      sendTelegramNotification(message);
-      const newAlertHistory = { ...alertHistory, [priceChangeAlertKey]: now };
-      setAlertHistory(newAlertHistory);
-      syncToCloud(inventory, null, null, newAlertHistory);
+💡 建議：注意盤勢變化`;
+          
+          sendLineNotification(message);
+          sendTelegramNotification(message);
+          
+          const newAlertHistory = { ...alertHistory, [alertKey]: { ...lastAlert, priceChange: now } };
+          setAlertHistory(newAlertHistory);
+          syncToCloud(inventory, null, null, newAlertHistory);
+        }
+      }
     }
-  }, [alertHistory, config, inventory, sendTelegramNotification, syncToCloud]);
-
+  }, [alertHistory, priceAlerts, inventory, config.PRICE_CHANGE_ALERT, sendLineNotification, sendTelegramNotification, syncToCloud]);
 
   // --- 7. 計算損益數據 ---
   const calculateData = useCallback((stock) => {
@@ -436,13 +416,13 @@ const App = () => {
     return () => clearInterval(interval);
   }, [inventory, totalHistory, calculateData]);
 
-  // --- 10. 每日報告（LINE + Telegram，包含股票名稱） ---
+  // --- 10. 每日報告（LINE + Telegram） ---
   const sendDailyReport = () => {
     const totalNet = inventory.reduce((sum, s) => sum + calculateData(s).netProfit, 0);
     const profitStocks = inventory.filter(s => calculateData(s).netProfit > 0).length;
     const lossStocks = inventory.filter(s => calculateData(s).netProfit < 0).length;
     
-    // LINE 版本（純文字，包含股票名稱）
+    // LINE 版本（純文字）
     const lineMessage = `📊 每日持股報告
 
 💰 總損益：${totalNet >= 0 ? '+' : ''}${Math.floor(totalNet).toLocaleString()} 元
@@ -454,10 +434,10 @@ const App = () => {
 ${inventory.map(s => {
   const { netProfit, returnRate, changePercent } = calculateData(s);
   const changeStr = changePercent !== 0 ? ` (今日${changePercent >= 0 ? '+' : ''}${changePercent.toFixed(2)}%)` : '';
-  return `${s.code} ${s.name || '未知'}: ${netProfit >= 0 ? '+' : ''}${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)${changeStr}`;
+  return `${s.code} ${s.name || ''}: ${netProfit >= 0 ? '+' : ''}${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)${changeStr}`;
 }).join('\n')}`;
     
-    // Telegram 版本（HTML 格式，包含股票名稱）
+    // Telegram 版本（HTML 格式）
     const telegramMessage = `<b>📊 每日持股報告</b>
 
 <b>💰 總損益：</b>${totalNet >= 0 ? '+' : ''}${Math.floor(totalNet).toLocaleString()} 元
@@ -470,7 +450,7 @@ ${inventory.map(s => {
   const { netProfit, returnRate, changePercent } = calculateData(s);
   const changeStr = changePercent !== 0 ? ` (今日${changePercent >= 0 ? '+' : ''}${changePercent.toFixed(2)}%)` : '';
   const profitColor = netProfit >= 0 ? '🔴' : '🟢';
-  return `${profitColor} <code>${s.code} ${s.name || '未知'}</code>: ${netProfit >= 0 ? '+' : ''}${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)${changeStr}`;
+  return `${profitColor} <code>${s.code} ${s.name || ''}</code>: ${netProfit >= 0 ? '+' : ''}${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)${changeStr}`;
 }).join('\n')}`;
     
     // 同時發送到 LINE 和 Telegram
