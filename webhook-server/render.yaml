@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: trade-webhook-server
+    env: node
+    region: singapore
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        value: 8257467510:AAG6Sz3nVEgOzmWfOi2s1Ogl8uLT0JVo51Q
+      - key: TELEGRAM_CHAT_ID
+        value: 8214660758
+      - key: FIREBASE_PRIVATE_KEY_ID
+        sync: false
+      - key: FIREBASE_PRIVATE_KEY
+        sync: false
+      - key: FIREBASE_CLIENT_EMAIL
+        sync: false
+      - key: FIREBASE_CLIENT_ID
+        sync: false
+      - key: FIREBASE_CERT_URL
+        sync: false

@@ -1,0 +1,29 @@
+{
+  "name": "trade-webhook-server",
+  "version": "1.0.0",
+  "description": "Render Webhook Server for Trade App Scheduled Reports",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": [
+    "webhook",
+    "telegram",
+    "scheduled-reports",
+    "stock-trading"
+  ],
+  "author": "Sainco",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "firebase-admin": "^12.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

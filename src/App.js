@@ -25,7 +25,8 @@ const DEFAULT_CONFIG = {
   TAX_RATE: 0.0015,
   MIN_FEE: 20,
   API_KEY: '725bd665-e2ca-4ae4-ba7b-fc8312ac158f',
-  ALERT_THRESHOLDS: [10, 20, 30] // 高峰回落警示閾值（%）
+  ALERT_THRESHOLDS: [10, 20, 30], // 高峰回落警示閉值（%）
+  PRICE_CHANGE_ALERT: 5 // 大漲大跌警示閉值（%）
 };
 
 // 台股升降單位
@@ -48,6 +49,7 @@ const App = () => {
   const [expandedCharts, setExpandedCharts] = useState({});
   const [totalHistory, setTotalHistory] = useState([]);
   const [alertHistory, setAlertHistory] = useState({});
+  const [priceAlerts, setPriceAlerts] = useState({}); // 價格警示設定 { stockCode: { target: number, stopLoss: number } }
 
   // --- 3. 雲端同步邏輯 ---
   useEffect(() => {
@@ -67,6 +69,9 @@ const App = () => {
           if (data.alertHistory) {
             setAlertHistory(data.alertHistory);
           }
+          if (data.priceAlerts) {
+            setPriceAlerts(data.priceAlerts);
+          }
         }
       },
       (err) => {
@@ -77,7 +82,7 @@ const App = () => {
     return () => unsub();
   }, []);
 
-  const syncToCloud = async (newStocks, newConfig = null, newTotalHistory = null, newAlertHistory = null) => {
+  const syncToCloud = async (newStocks, newConfig = null, newTotalHistory = null, newAlertHistory = null, newPriceAlerts = null) => {
     try {
       const dataToSync = { stocks: newStocks };
       if (newConfig) {
@@ -88,6 +93,9 @@ const App = () => {
       }
       if (newAlertHistory !== null) {
         dataToSync.alertHistory = newAlertHistory;
+      }
+      if (newPriceAlerts !== null) {
+        dataToSync.priceAlerts = newPriceAlerts;
       }
       await setDoc(doc(db, "users", USER_DOC_ID), dataToSync, { merge: true });
       setError(null);
@@ -183,12 +191,13 @@ const App = () => {
     config.ALERT_THRESHOLDS.forEach(threshold => {
       const alertKey = `${stock.code}_${threshold}`;
       const lastAlert = alertHistory[alertKey];
+      const telegramKey = `${stock.code}_${threshold}_tg`;
+      const lastTelegramAlert = alertHistory[telegramKey];
       
-      // 檢查是否達到警示條件且尚未發送過（或距上次警示超過 1 小時）
+      // 檢查是否達到警示條件
       if (drawdownPercent >= threshold) {
         const now = Date.now();
-        if (!lastAlert || (now - lastAlert) > 3600000) {
-          const message = `⚠️ 高峰回落警示
+        const message = `⚠️ 高峰回落警示
 
 📊 股票：${stock.code} ${stock.name || ''}
 📈 最高損益：${Math.floor(stock.highPoint.profit).toLocaleString()} 元
@@ -197,18 +206,98 @@ const App = () => {
 
 💡 建議：考慮是否減碼或停利`;
 
-          // 同時發送到 LINE 和 Telegram
+        // LINE 通知：每小時最多一次
+        if (!lastAlert || (now - lastAlert) > 3600000) {
           sendLineNotification(message);
-          sendTelegramNotification(message);
-          
-          // 記錄警示時間
           const newAlertHistory = { ...alertHistory, [alertKey]: now };
+          setAlertHistory(newAlertHistory);
+          syncToCloud(inventory, null, null, newAlertHistory);
+        }
+        
+        // Telegram 通知：即時推送（無時間限制）
+        if (!lastTelegramAlert || drawdownPercent > threshold) {
+          sendTelegramNotification(message);
+          const newAlertHistory = { ...alertHistory, [telegramKey]: now };
           setAlertHistory(newAlertHistory);
           syncToCloud(inventory, null, null, newAlertHistory);
         }
       }
     });
-  }, [alertHistory, config.ALERT_THRESHOLDS, inventory, sendLineNotification, sendTelegramNotification]);
+  }, [alertHistory, config.ALERT_THRESHOLDS, inventory, sendLineNotification, sendTelegramNotification, syncToCloud]);
+
+  // --- 6.5 價格警示檢查（目標價、停損價、大漲大跌） ---
+  const checkPriceAlerts = useCallback((stock, currentPrice) => {
+    const alertKey = `price_${stock.code}`;
+    const lastAlert = alertHistory[alertKey] || {};
+    const now = Date.now();
+    
+    // 1. 目標價警示
+    if (priceAlerts[stock.code]?.target && currentPrice >= priceAlerts[stock.code].target) {
+      if (!lastAlert.target || (now - lastAlert.target) > 3600000) {
+        const message = `🎯 達到目標價警示
+
+📊 股票：${stock.code} ${stock.name || ''}
+🎯 目標價：${priceAlerts[stock.code].target} 元
+💵 現價：${currentPrice} 元
+
+💡 建議：考慮是否停利出場`;
+        
+        sendLineNotification(message);
+        sendTelegramNotification(message);
+        
+        const newAlertHistory = { ...alertHistory, [alertKey]: { ...lastAlert, target: now } };
+        setAlertHistory(newAlertHistory);
+        syncToCloud(inventory, null, null, newAlertHistory);
+      }
+    }
+    
+    // 2. 停損價警示
+    if (priceAlerts[stock.code]?.stopLoss && currentPrice <= priceAlerts[stock.code].stopLoss) {
+      if (!lastAlert.stopLoss || (now - lastAlert.stopLoss) > 3600000) {
+        const message = `⛔ 跌破停損價警示
+
+📊 股票：${stock.code} ${stock.name || ''}
+⛔ 停損價：${priceAlerts[stock.code].stopLoss} 元
+💵 現價：${currentPrice} 元
+
+⚠️ 建議：考慮是否停損出場`;
+        
+        sendLineNotification(message);
+        sendTelegramNotification(message);
+        
+        const newAlertHistory = { ...alertHistory, [alertKey]: { ...lastAlert, stopLoss: now } };
+        setAlertHistory(newAlertHistory);
+        syncToCloud(inventory, null, null, newAlertHistory);
+      }
+    }
+    
+    // 3. 大漲大跌警示
+    if (stock.previousClose) {
+      const changePercent = ((currentPrice - stock.previousClose) / stock.previousClose) * 100;
+      
+      if (Math.abs(changePercent) >= config.PRICE_CHANGE_ALERT) {
+        if (!lastAlert.priceChange || (now - lastAlert.priceChange) > 3600000) {
+          const direction = changePercent > 0 ? '大漲' : '大跌';
+          const emoji = changePercent > 0 ? '🚀' : '📉';
+          const message = `${emoji} ${direction}警示
+
+📊 股票：${stock.code} ${stock.name || ''}
+💵 現價：${currentPrice} 元
+📈 漲跌幅：${changePercent >= 0 ? '+' : ''}${changePercent.toFixed(2)}%
+📅 昨收：${stock.previousClose} 元
+
+💡 建議：注意盤勢變化`;
+          
+          sendLineNotification(message);
+          sendTelegramNotification(message);
+          
+          const newAlertHistory = { ...alertHistory, [alertKey]: { ...lastAlert, priceChange: now } };
+          setAlertHistory(newAlertHistory);
+          syncToCloud(inventory, null, null, newAlertHistory);
+        }
+      }
+    }
+  }, [alertHistory, priceAlerts, inventory, config.PRICE_CHANGE_ALERT, sendLineNotification, sendTelegramNotification, syncToCloud]);
 
   // --- 7. 計算損益數據 ---
   const calculateData = useCallback((stock) => {
@@ -270,6 +359,9 @@ const App = () => {
               
               // 檢查高峰回落警示
               checkDrawdownAlert(s, netProfit);
+              
+              // 檢查價格警示
+              checkPriceAlerts(s, newPrice);
               
               let history = s.history || [];
               const lastRecord = history[history.length - 1];
