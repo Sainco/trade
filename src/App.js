@@ -149,6 +149,29 @@ const App = () => {
     }
   }, []);
 
+  // --- 5.5 Telegram 通知功能 ---
+  const sendTelegramNotification = useCallback(async (message) => {
+    try {
+      const response = await fetch('/api/send-telegram', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message, parse_mode: 'HTML' })
+      });
+      
+      const data = await response.json();
+      
+      if (!response.ok) {
+        throw new Error(data.error || 'Telegram 通知發送失敗');
+      }
+      
+      return true;
+    } catch (e) {
+      console.error('Telegram 通知錯誤：', e);
+      setError('Telegram 通知發送失敗：' + e.message);
+      return false;
+    }
+  }, []);
+
   // --- 6. 高峰回落警示檢查 ---
   const checkDrawdownAlert = useCallback((stock, netProfit) => {
     if (!stock.highPoint || netProfit >= stock.highPoint.profit) {
@@ -174,7 +197,9 @@ const App = () => {
 
 💡 建議：考慮是否減碼或停利`;
 
+          // 同時發送到 LINE 和 Telegram
           sendLineNotification(message);
+          sendTelegramNotification(message);
           
           // 記錄警示時間
           const newAlertHistory = { ...alertHistory, [alertKey]: now };
@@ -183,7 +208,7 @@ const App = () => {
         }
       }
     });
-  }, [alertHistory, config.ALERT_THRESHOLDS, inventory, sendLineNotification]);
+  }, [alertHistory, config.ALERT_THRESHOLDS, inventory, sendLineNotification, sendTelegramNotification]);
 
   // --- 7. 計算損益數據 ---
   const calculateData = useCallback((stock) => {
@@ -293,13 +318,14 @@ const App = () => {
     return () => clearInterval(interval);
   }, [inventory, totalHistory, calculateData]);
 
-  // --- 10. LINE 每日報告 ---
+  // --- 10. 每日報告（LINE + Telegram） ---
   const sendDailyReport = () => {
     const totalNet = inventory.reduce((sum, s) => sum + calculateData(s).netProfit, 0);
     const profitStocks = inventory.filter(s => calculateData(s).netProfit > 0).length;
     const lossStocks = inventory.filter(s => calculateData(s).netProfit < 0).length;
     
-    const message = `📊 每日持股報告
+    // LINE 版本（純文字）
+    const lineMessage = `📊 每日持股報告
 
 💰 總損益：${totalNet >= 0 ? '+' : ''}${Math.floor(totalNet).toLocaleString()} 元
 
@@ -313,8 +339,26 @@ ${inventory.map(s => {
   return `${s.code} ${s.name || ''}: ${netProfit >= 0 ? '+' : ''}${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)${changeStr}`;
 }).join('\n')}`;
     
-    sendLineNotification(message);
-    alert('LINE 報告已發送！');
+    // Telegram 版本（HTML 格式）
+    const telegramMessage = `<b>📊 每日持股報告</b>
+
+<b>💰 總損益：</b>${totalNet >= 0 ? '+' : ''}${Math.floor(totalNet).toLocaleString()} 元
+
+<b>📈 獲利股票：</b>${profitStocks} 檔
+<b>📉 虧損股票：</b>${lossStocks} 檔
+
+<b>持股明細：</b>
+${inventory.map(s => {
+  const { netProfit, returnRate, changePercent } = calculateData(s);
+  const changeStr = changePercent !== 0 ? ` (今日${changePercent >= 0 ? '+' : ''}${changePercent.toFixed(2)}%)` : '';
+  const profitColor = netProfit >= 0 ? '🔴' : '🟢';
+  return `${profitColor} <code>${s.code} ${s.name || ''}</code>: ${netProfit >= 0 ? '+' : ''}${Math.floor(netProfit).toLocaleString()} (${returnRate.toFixed(2)}%)${changeStr}`;
+}).join('\n')}`;
+    
+    // 同時發送到 LINE 和 Telegram
+    sendLineNotification(lineMessage);
+    sendTelegramNotification(telegramMessage);
+    alert('報告已發送到 LINE 和 Telegram！');
   };
 
   const handleDelete = (id) => {
